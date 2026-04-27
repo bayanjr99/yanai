@@ -165,8 +165,10 @@ def run_full_pipeline(
 
 import re as _re
 
-DATA_ROOT   = os.getenv("DATA_ROOT",   "data")
-OUTPUT_ROOT = os.getenv("OUTPUT_ROOT", "output")
+DATA_ROOT    = os.getenv("DATA_ROOT",   "data")
+OUTPUT_ROOT  = os.getenv("OUTPUT_ROOT", "output")
+# History lives inside DATA_ROOT so it persists on Render's mounted disk
+HISTORY_ROOT = os.path.join(DATA_ROOT, "months")
 
 # Agreements and overrides live at the data/ root (existing convention)
 _AGREEMENTS_CANDIDATES = [
@@ -269,3 +271,111 @@ def run_month_pipeline(
         overrides_path  = overrides_path,
         output_dir      = output_root,
     )
+
+
+# ---------------------------------------------------------------------------
+# Monthly history — persist results inside /data/months/{MM-YYYY}/
+# ---------------------------------------------------------------------------
+
+def get_available_months() -> list[str]:
+    """
+    List all months in HISTORY_ROOT that have saved results (kpis.json).
+    Returns sorted list e.g. ['01-2025', '02-2025', ..., '02-2026'].
+    """
+    if not os.path.isdir(HISTORY_ROOT):
+        return []
+    return sorted(
+        d for d in os.listdir(HISTORY_ROOT)
+        if os.path.isdir(os.path.join(HISTORY_ROOT, d))
+        and os.path.exists(os.path.join(HISTORY_ROOT, d, "kpis.json"))
+    )
+
+
+def save_month_history(
+    month: str,
+    result: PipelineResult,
+    kpis: dict,
+) -> None:
+    """
+    Persist all monthly results to HISTORY_ROOT/{month}/ so they
+    survive Render restarts (disk mount at /data).
+
+    Saves:
+      kpis.json          — KPI totals (billing, cost, profit, counts)
+      result.xlsx        — full billing detail (from report_builder)
+      profitability.xlsx — profitability per client
+      issues.xlsx        — data-quality issues
+      clients.csv        — per-client billing/profit for fast comparison
+    """
+    month_dir = os.path.join(HISTORY_ROOT, month)
+    os.makedirs(month_dir, exist_ok=True)
+
+    # kpis.json
+    import json as _json
+    with open(os.path.join(month_dir, "kpis.json"), "w") as f:
+        _json.dump(kpis, f)
+
+    # Excel reports
+    try:
+        save_organized_reports(result.detail_df, result.issues_df, HISTORY_ROOT, month)
+    except Exception:
+        pass
+
+    # Per-client CSV (for fast comparison without re-reading Excel)
+    if not result.detail_df.empty:
+        try:
+            client_df = (
+                result.detail_df
+                .groupby("client", as_index=False)
+                .agg(billing_amount=("billing_amount", "sum"),
+                     cost          =("cost",           "sum"),
+                     profit        =("profit",         "sum"))
+            )
+            client_df["month"] = month
+            client_df.to_csv(os.path.join(month_dir, "clients.csv"), index=False)
+        except Exception:
+            pass
+
+
+def load_month_kpis(month: str) -> dict | None:
+    """Return saved kpis.json for a month, or None."""
+    import json as _json
+    p = os.path.join(HISTORY_ROOT, month, "kpis.json")
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                return _json.load(f)
+        except Exception:
+            pass
+    return None
+
+
+def load_month_clients(month: str) -> "pd.DataFrame":
+    """Return saved per-client CSV for a month, or empty DataFrame."""
+    import pandas as _pd
+    p = os.path.join(HISTORY_ROOT, month, "clients.csv")
+    if os.path.exists(p):
+        try:
+            return _pd.read_csv(p)
+        except Exception:
+            pass
+    return _pd.DataFrame()
+
+
+def load_trend_df() -> "pd.DataFrame":
+    """
+    Build a time-series DataFrame from all saved kpis.json files.
+    Suitable for trend charts.
+    """
+    import pandas as _pd, json as _json
+    rows = []
+    for m in get_available_months():
+        p = os.path.join(HISTORY_ROOT, m, "kpis.json")
+        try:
+            with open(p) as f:
+                d = _json.load(f)
+            d["month"] = m
+            rows.append(d)
+        except Exception:
+            pass
+    return _pd.DataFrame(rows) if rows else _pd.DataFrame()

@@ -24,6 +24,9 @@ from auth import login_user, register_user
 from pipeline import (
     run_month_pipeline, list_available_months,
     month_file_mtime, DATA_ROOT, OUTPUT_ROOT,
+    get_available_months, save_month_history,
+    load_month_kpis, load_month_clients, load_trend_df,
+    HISTORY_ROOT,
 )
 from core.validation import ValidationError
 from core.analytics import (
@@ -372,6 +375,34 @@ with st.sidebar:
         )
     st.divider()
 
+    # ── Agreements file (required, shared across all months) ─────────────────
+    _agr_path = os.path.join(DATA_ROOT, "agreements.xlsx")
+    _agr_ok   = os.path.exists(_agr_path)
+
+    if not _agr_ok:
+        st.warning("⚠️ חסר קובץ הסכמים")
+        agr_up = st.file_uploader(
+            "📋 הסכמים (agreements.xlsx)", type=["xlsx"], key="up_agr_main"
+        )
+        if agr_up:
+            os.makedirs(DATA_ROOT, exist_ok=True)
+            with open(_agr_path, "wb") as _f:
+                _f.write(agr_up.read())
+            st.success("✅ הסכמים נשמרו")
+            st.rerun()
+    else:
+        st.caption("✅ הסכמים נטענו")
+        if st.button("🔄 עדכן הסכמים", use_container_width=True, key="replace_agr"):
+            agr_up2 = st.file_uploader(
+                "📋 הסכמים חדשים", type=["xlsx"], key="up_agr_replace"
+            )
+            if agr_up2:
+                with open(_agr_path, "wb") as _f:
+                    _f.write(agr_up2.read())
+                st.success("✅ עודכן"); st.rerun()
+
+    st.divider()
+
     # Month selector + calculate
     available_months = list_available_months(DATA_ROOT)
     if available_months:
@@ -379,8 +410,14 @@ with st.sidebar:
             "📅 חודש לחישוב", available_months,
             index=len(available_months) - 1, key="sel_month",
         )
-        calc_btn = st.button("🚀 חשב חיוב", type="primary", use_container_width=True)
-        if calc_btn:
+        calc_btn = st.button(
+            "🚀 חשב חיוב",
+            type="primary",
+            use_container_width=True,
+            disabled=not _agr_ok,
+            help="" if _agr_ok else "העלה קובץ הסכמים תחילה",
+        )
+        if calc_btn and _agr_ok:
             mtime = month_file_mtime(selected_month, DATA_ROOT)
             with st.spinner(f"מחשב {selected_month}..."):
                 cached = _run_month(selected_month, mtime)
@@ -391,6 +428,20 @@ with st.sidebar:
                 kp = kpi_summary(cached["detail_df"])
                 kp["n_issues"] = len(cached["issues_df"])
                 _save_kpis(selected_month, kp)
+                # Persist to /data/months/ for history (survives Render restarts)
+                try:
+                    from pipeline import PipelineResult
+                    import types
+                    _r = types.SimpleNamespace(
+                        detail_df=cached["detail_df"],
+                        daily_df=cached["daily_df"],
+                        issues_df=cached["issues_df"],
+                        validation=cached["validation"],
+                        month_str=cached["month_str"],
+                    )
+                    save_month_history(selected_month, _r, kp)
+                except Exception:
+                    pass
                 try: log_run(selected_month, kp, _user.get("id"))
                 except Exception: pass
                 st.rerun()
@@ -401,11 +452,23 @@ with st.sidebar:
         st.warning("לא נמצאו חודשים")
 
     # Add month (secondary)
-    with st.expander("➕ הוסף חודש"):
+    with st.expander("➕ הוסף / עדכן נתונים"):
+        # Agreements (shared)
+        agr_exp = st.file_uploader(
+            "📋 הסכמים (agreements.xlsx)", type=["xlsx"], key="up_agr_exp"
+        )
+        if agr_exp:
+            os.makedirs(DATA_ROOT, exist_ok=True)
+            with open(os.path.join(DATA_ROOT, "agreements.xlsx"), "wb") as _f:
+                _f.write(agr_exp.read())
+            st.success("✅ הסכמים נשמרו"); st.rerun()
+
+        st.divider()
+        # Monthly data
         nm = st.text_input("חודש (MM-YYYY)", placeholder="02-2026", key="nm_in")
-        hu = st.file_uploader("שעות", type=["pdf","xlsx"], key="up_h")
-        cu = st.file_uploader("עלויות", type=["xlsx"], key="up_c")
-        if st.button("💾 שמור", disabled=not(nm and hu and cu), key="save_month"):
+        hu = st.file_uploader("שעות (PDF/xlsx)", type=["pdf","xlsx"], key="up_h")
+        cu = st.file_uploader("עלויות (xlsx)", type=["xlsx"], key="up_c")
+        if st.button("💾 שמור חודש", disabled=not(nm and hu and cu), key="save_month"):
             _save_month_files(nm, hu, cu)
             st.success(f"✅ {nm} נשמר"); st.rerun()
 
@@ -792,6 +855,187 @@ if not filtered.empty and not daily_df.empty:
             s3.metric('סה"כ חיוב', f"₪{sb:,.2f}")
 else:
     st.caption("הרץ חישוב כדי לאפשר פירוט יומי")
+
+# ===========================================================================
+# ===========================================================================
+# HISTORY & BI DASHBOARD
+# ===========================================================================
+
+st.divider()
+st.markdown('<div class="sec-hdr">📅 היסטוריה ואנליטיקה</div>', unsafe_allow_html=True)
+
+_hist_months = get_available_months()
+
+if not _hist_months:
+    st.info("📂 אין נתונים היסטוריים עדיין — נתונים יצטברו לאחר כל חישוב.")
+else:
+    # ── Tabs: Dashboard | Monthly Details | Clients ──────────────────────────
+    _tab_dash, _tab_monthly, _tab_clients = st.tabs(
+        ["📊 דשבורד", "📋 פירוט חודשי", "👥 לקוחות"]
+    )
+
+    @st.cache_data(show_spinner=False, ttl=120)
+    def _cached_trend() -> pd.DataFrame:
+        return load_trend_df()
+
+    @st.cache_data(show_spinner=False, ttl=120)
+    def _cached_clients_all() -> pd.DataFrame:
+        frames = []
+        for _m in get_available_months():
+            _df = load_month_clients(_m)
+            if not _df.empty:
+                frames.append(_df)
+        if frames:
+            return pd.concat(frames, ignore_index=True)
+        return pd.DataFrame()
+
+    _trend_df    = _cached_trend()
+    _clients_all = _cached_clients_all()
+
+    # ── TAB 1: Dashboard ──────────────────────────────────────────────────────
+    with _tab_dash:
+        if not _trend_df.empty:
+            # KPI bar — latest month
+            _latest = _trend_df.iloc[-1]
+            _prev   = _trend_df.iloc[-2] if len(_trend_df) >= 2 else None
+
+            def _chg(cur, prev, col):
+                if prev is None or prev.get(col, 0) == 0: return ""
+                p = (cur.get(col, 0) - prev[col]) / abs(prev[col]) * 100
+                c = "#16a34a" if p >= 0 else "#dc2626"
+                return f'<span style="color:{c};font-size:13px;font-weight:700">{"+" if p>=0 else ""}{p:.1f}%</span>'
+
+            hk1, hk2, hk3, hk4 = st.columns(4)
+            for _col, _lbl, _fmt, _clr in [
+                (hk1, "💰 חיוב (חודש אחרון)",  f'₪{_latest.get("total_billing",0):,.0f}',  ""),
+                (hk2, "📈 רווח",               f'₪{_latest.get("total_profit",0):,.0f}',   "green" if _latest.get("total_profit",0)>=0 else "red"),
+                (hk3, "% שינוי חיוב",          _chg(_latest, _prev, "total_billing"),        ""),
+                (hk4, "% שינוי רווח",          _chg(_latest, _prev, "total_profit"),         ""),
+            ]:
+                with _col:
+                    st.markdown(
+                        f'<div class="kpi-card"><div class="kpi-label">{_lbl}</div>'
+                        f'<div class="kpi-value {_clr}">{_fmt}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+            # Charts: trend + pie
+            if _PLOTLY:
+                _hc1, _hc2 = st.columns([2, 1])
+                with _hc1:
+                    st.caption("מגמת הכנסות ורווח")
+                    _fig_t = _line_trend(_trend_df)
+                    if _fig_t:
+                        st.plotly_chart(_fig_t, use_container_width=True, config={"displayModeBar": False})
+
+                with _hc2:
+                    if not _clients_all.empty:
+                        st.caption("חלוקת הכנסות (כל הזמנים)")
+                        _cl_sum = _clients_all.groupby("client")["billing_amount"].sum().nlargest(5).reset_index()
+                        _fig_pie = _pie_revenue(_cl_sum.rename(columns={"billing_amount":"billing_amount"}))
+                        if _fig_pie:
+                            st.plotly_chart(_fig_pie, use_container_width=True, config={"displayModeBar": False})
+
+    # ── TAB 2: Monthly Details ────────────────────────────────────────────────
+    with _tab_monthly:
+        _sel_hist = st.selectbox(
+            "בחר חודש:", _hist_months, index=len(_hist_months)-1, key="hist_sel"
+        )
+        _hkpis = load_month_kpis(_sel_hist)
+
+        if _hkpis:
+            _prev_m  = _prev_month(_sel_hist)
+            _pkpis   = load_month_kpis(_prev_m) if _prev_m else None
+
+            mk1, mk2, mk3, mk4 = st.columns(4)
+            _mmargin = (_hkpis.get("total_profit",0) / _hkpis.get("total_billing",1) * 100) if _hkpis.get("total_billing") else 0
+            for _col, _lbl, _val in [
+                (mk1, "💰 חיוב",   f'₪{_hkpis.get("total_billing",0):,.0f}'),
+                (mk2, "📤 עלות",   f'₪{_hkpis.get("total_cost",0):,.0f}'),
+                (mk3, "📈 רווח",   f'₪{_hkpis.get("total_profit",0):,.0f}'),
+                (mk4, "% מרג'ין",  f'{_mmargin:.1f}%'),
+            ]:
+                with _col:
+                    st.markdown(
+                        f'<div class="kpi-card"><div class="kpi-label">{_lbl}</div>'
+                        f'<div class="kpi-value">{_val}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # Month comparison
+            if _pkpis:
+                st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+                _cb = _hkpis.get("total_billing",0); _pb = _pkpis.get("total_billing",0)
+                _cp = _hkpis.get("total_profit",0);  _pp = _pkpis.get("total_profit",0)
+                def _mpct(c, p):
+                    if not p: return "—"
+                    v = (c-p)/abs(p)*100
+                    clr = "#16a34a" if v>=0 else "#dc2626"
+                    return f'<span style="color:{clr};font-weight:700">{"+" if v>=0 else ""}{v:.1f}%</span>'
+                st.markdown(
+                    f'<div class="comp-bar">📅 vs {_prev_m}: '
+                    f'חיוב ₪{_pb:,.0f} → ₪{_cb:,.0f} {_mpct(_cb,_pb)}'
+                    f' &nbsp;|&nbsp; רווח ₪{_pp:,.0f} → ₪{_cp:,.0f} {_mpct(_cp,_pp)}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            # Client breakdown for selected month
+            _hcl = load_month_clients(_sel_hist)
+            if not _hcl.empty and _PLOTLY:
+                _hcc1, _hcc2 = st.columns(2)
+                with _hcc1:
+                    st.caption(f"חיוב לפי לקוח — {_sel_hist}")
+                    _f = _bar_billing(_hcl.rename(columns={"billing_amount":"billing_amount"}))
+                    if _f: st.plotly_chart(_f, use_container_width=True, config={"displayModeBar": False})
+                with _hcc2:
+                    st.caption(f"רווח לפי לקוח — {_sel_hist}")
+                    _f = _bar_profit(_hcl)
+                    if _f: st.plotly_chart(_f, use_container_width=True, config={"displayModeBar": False})
+
+    # ── TAB 3: Clients ────────────────────────────────────────────────────────
+    with _tab_clients:
+        if not _clients_all.empty:
+            _all_cl = sorted(_clients_all["client"].dropna().unique().tolist())
+            _sel_cl_h = st.selectbox("בחר לקוח:", _all_cl, key="hist_cl_sel")
+
+            _cl_hist = _clients_all[_clients_all["client"] == _sel_cl_h].sort_values("month")
+
+            if not _cl_hist.empty:
+                # Summary metrics
+                _tot_b = _cl_hist["billing_amount"].sum()
+                _tot_p = _cl_hist["profit"].sum()
+                _avg_m = _tot_p / _tot_b * 100 if _tot_b else 0
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("סה\"כ חיוב (כל הזמנים)", f"₪{_tot_b:,.0f}")
+                cc2.metric("סה\"כ רווח",              f"₪{_tot_p:,.0f}")
+                cc3.metric("מרג'ין ממוצע",            f"{_avg_m:.1f}%")
+
+                # Trend for this client
+                if _PLOTLY:
+                    _fig_cl = go.Figure()
+                    _fig_cl.add_trace(go.Scatter(x=_cl_hist["month"], y=_cl_hist["billing_amount"],
+                        name="חיוב", line=dict(color="#1F497D", width=2.5)))
+                    _fig_cl.add_trace(go.Scatter(x=_cl_hist["month"], y=_cl_hist["profit"],
+                        name="רווח", line=dict(color="#16a34a", width=2)))
+                    _fig_cl.update_layout(**{**_PL, "showlegend":True, "height":240},
+                        legend=dict(orientation="h",y=1.08),
+                        xaxis=dict(showgrid=False), yaxis=dict(showgrid=True, gridcolor="#f3f4f6"))
+                    st.plotly_chart(_fig_cl, use_container_width=True, config={"displayModeBar": False})
+
+            # Alerts — negative profit clients
+            _alert_clients = (
+                _clients_all.groupby("client")[["billing_amount","profit"]].sum()
+                .query("profit < 0").sort_values("profit")
+            )
+            if not _alert_clients.empty:
+                st.warning(f"⚠️ {len(_alert_clients)} לקוחות עם רווח שלילי לאורך כל הזמנים:")
+                st.dataframe(
+                    _alert_clients.style.format({"billing_amount":"₪{:,.0f}","profit":"₪{:,.0f}"}),
+                    use_container_width=True,
+                )
 
 # ===========================================================================
 # DOWNLOADS
