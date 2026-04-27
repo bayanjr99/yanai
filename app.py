@@ -464,13 +464,78 @@ with st.sidebar:
             st.success("✅ הסכמים נשמרו"); st.rerun()
 
         st.divider()
+        # Shared costs file (optional — used when month folder has no costs.xlsx)
+        shared_costs = st.file_uploader(
+            "💼 עלויות משותפות (אופציונלי — לכל החודשים)",
+            type=["xlsx"], key="up_shared_costs",
+        )
+        if shared_costs:
+            _sc_path = os.path.join(DATA_ROOT, "costs_shared.xlsx")
+            with open(_sc_path, "wb") as _f:
+                _f.write(shared_costs.read())
+            st.success("✅ עלויות משותפות נשמרו")
+
         # Monthly data
         nm = st.text_input("חודש (MM-YYYY)", placeholder="02-2026", key="nm_in")
         hu = st.file_uploader("שעות (PDF/xlsx)", type=["pdf","xlsx"], key="up_h")
-        cu = st.file_uploader("עלויות (xlsx)", type=["xlsx"], key="up_c")
+        cu = st.file_uploader("עלויות חודש (xlsx)", type=["xlsx"], key="up_c")
         if st.button("💾 שמור חודש", disabled=not(nm and hu and cu), key="save_month"):
             _save_month_files(nm, hu, cu)
             st.success(f"✅ {nm} נשמר"); st.rerun()
+
+        st.divider()
+        # ── Batch: calculate all available months ──────────────────────────
+        st.markdown("**⚡ חשב כל החודשים בבת אחת**")
+        _all_available = list_available_months(DATA_ROOT)
+        _already_done  = set(get_available_months())
+        _pending = [m for m in _all_available if m not in _already_done]
+        if _pending:
+            st.caption(f"{len(_pending)} חודשים ממתינים לחישוב: {', '.join(_pending)}")
+        else:
+            st.caption("✅ כל החודשים חושבו")
+        if st.button(
+            f"🚀 חשב {len(_pending)} חודשים",
+            disabled=(not _pending or not _agr_ok),
+            key="batch_calc",
+        ):
+            _batch_ok, _batch_fail = [], []
+            _progress = st.progress(0)
+            _status   = st.empty()
+            for _i, _bm in enumerate(_pending):
+                _status.text(f"מחשב {_bm} ({_i+1}/{len(_pending)})...")
+                try:
+                    # Use shared costs fallback if month has no costs.xlsx
+                    _month_dir   = os.path.join(DATA_ROOT, _bm)
+                    _costs_path  = os.path.join(_month_dir, "costs.xlsx")
+                    _shared_path = os.path.join(DATA_ROOT, "costs_shared.xlsx")
+                    if not os.path.exists(_costs_path) and os.path.exists(_shared_path):
+                        import shutil as _sh
+                        _sh.copy(_shared_path, _costs_path)
+
+                    _br = _run_month(_bm, month_file_mtime(_bm, DATA_ROOT))
+                    if _br["success"]:
+                        _bkp = kpi_summary(_br["detail_df"])
+                        _bkp["n_issues"] = len(_br["issues_df"])
+                        import types as _tp
+                        _robj = _tp.SimpleNamespace(
+                            detail_df=_br["detail_df"], daily_df=_br["daily_df"],
+                            issues_df=_br["issues_df"], validation=_br["validation"],
+                            month_str=_br["month_str"],
+                        )
+                        save_month_history(_bm, _robj, _bkp)
+                        _batch_ok.append(_bm)
+                    else:
+                        _batch_fail.append(f"{_bm}: {_br['error']}")
+                except Exception as _e:
+                    _batch_fail.append(f"{_bm}: {_e}")
+                _progress.progress((_i + 1) / len(_pending))
+            _status.empty()
+            if _batch_ok:
+                st.success(f"✅ הושלמו: {', '.join(_batch_ok)}")
+            if _batch_fail:
+                for _ef in _batch_fail:
+                    st.warning(f"⚠️ {_ef}")
+            st.rerun()
 
     # Filters (post-calculate)
     if st.session_state.get("result"):
