@@ -26,7 +26,9 @@ from pipeline import (
     month_file_mtime, DATA_ROOT, OUTPUT_ROOT,
     get_available_months, save_month_history,
     load_month_kpis, load_month_clients, load_trend_df,
-    HISTORY_ROOT,
+    HISTORY_ROOT, MASTER_PATH,
+    update_master, get_all_data,
+    filter_by_client, get_profit_trend, get_top_clients,
 )
 from core.validation import ValidationError
 from core.analytics import (
@@ -428,9 +430,8 @@ with st.sidebar:
                 kp = kpi_summary(cached["detail_df"])
                 kp["n_issues"] = len(cached["issues_df"])
                 _save_kpis(selected_month, kp)
-                # Persist to /data/months/ for history (survives Render restarts)
+                # Persist to /data/months/ for history + update master.parquet
                 try:
-                    from pipeline import PipelineResult
                     import types
                     _r = types.SimpleNamespace(
                         detail_df=cached["detail_df"],
@@ -440,6 +441,7 @@ with st.sidebar:
                         month_str=cached["month_str"],
                     )
                     save_month_history(selected_month, _r, kp)
+                    update_master(cached["detail_df"], selected_month)
                 except Exception:
                     pass
                 try: log_run(selected_month, kp, _user.get("id"))
@@ -523,6 +525,7 @@ with st.sidebar:
                             month_str=_br["month_str"],
                         )
                         save_month_history(_bm, _robj, _bkp)
+                        update_master(_br["detail_df"], _bm)
                         _batch_ok.append(_bm)
                     else:
                         _batch_fail.append(f"{_bm}: {_br['error']}")
@@ -939,23 +942,49 @@ else:
         ["📊 דשבורד", "📋 פירוט חודשי", "👥 לקוחות"]
     )
 
-    @st.cache_data(show_spinner=False, ttl=120)
-    def _cached_trend() -> pd.DataFrame:
-        return load_trend_df()
+    @st.cache_data(show_spinner=False, ttl=60)
+    def _load_master_cached() -> pd.DataFrame:
+        return get_all_data()
 
-    @st.cache_data(show_spinner=False, ttl=120)
-    def _cached_clients_all() -> pd.DataFrame:
-        frames = []
-        for _m in get_available_months():
-            _df = load_month_clients(_m)
-            if not _df.empty:
-                frames.append(_df)
-        if frames:
-            return pd.concat(frames, ignore_index=True)
-        return pd.DataFrame()
+    _master_raw = _load_master_cached()
 
-    _trend_df    = _cached_trend()
-    _clients_all = _cached_clients_all()
+    # ── Filters ────────────────────────────────────────────────────────────────
+    if not _master_raw.empty and "month" in _master_raw.columns:
+        _months_all = sorted(_master_raw["month"].unique().tolist())
+        _mf1, _mf2, _mf3 = st.columns(3)
+        with _mf1:
+            _date_range = st.select_slider(
+                "📅 טווח חודשים",
+                options=_months_all,
+                value=(_months_all[0], _months_all[-1]),
+                key="master_range",
+            )
+        with _mf2:
+            _f_cl = st.multiselect(
+                "👥 לקוח", sorted(_master_raw["client"].dropna().unique()),
+                key="master_cl",
+            )
+        with _mf3:
+            _f_em = st.multiselect(
+                "👤 עובד",
+                sorted(_master_raw["employee_name"].dropna().unique()) if "employee_name" in _master_raw.columns else [],
+                key="master_em",
+            )
+
+        _mask = (
+            (_master_raw["month"] >= _date_range[0]) &
+            (_master_raw["month"] <= _date_range[1])
+        )
+        _master = _master_raw[_mask]
+        if _f_cl: _master = filter_by_client(_master, _f_cl)
+        if _f_em and "employee_name" in _master.columns:
+            _master = _master[_master["employee_name"].isin(_f_em)]
+    else:
+        _master = _master_raw
+
+    # Derive trend + clients from master (fast — already loaded)
+    _trend_df    = get_profit_trend(_master)
+    _clients_all = _master  # use full row-level data
 
     # ── TAB 1: Dashboard ──────────────────────────────────────────────────────
     with _tab_dash:
@@ -1122,11 +1151,104 @@ with d3:
         st.download_button("📈 רווחיות",      res["profitability_bytes"], f"profitability_{_mn}.xlsx", _mime)
 
 # ===========================================================================
-# CLAUDE CHAT (optional)
+# AI BUSINESS ASSISTANT
+# ===========================================================================
+
+st.divider()
+st.markdown('<div class="sec-hdr">🤖 שאל את המערכת</div>', unsafe_allow_html=True)
+
+try:
+    from core.ai_data_assistant import load_ai_dataset, answer_question
+
+    @st.cache_data(show_spinner=False, ttl=120)
+    def _ai_dataset() -> pd.DataFrame:
+        return load_ai_dataset()
+
+    _ai_df = _ai_dataset()
+
+    # Quick-action buttons
+    _qb1, _qb2, _qb3, _qb4, _qb5 = st.columns(5)
+    _quick_q = ""
+    with _qb1:
+        if st.button("🏆 לקוחות רווחיים", use_container_width=True, key="q1"):
+            _quick_q = "מי הלקוחות הכי רווחיים?"
+    with _qb2:
+        if st.button("📉 לקוחות בהפסד", use_container_width=True, key="q2"):
+            _quick_q = "אילו לקוחות בהפסד?"
+    with _qb3:
+        if st.button("📅 השוואה לחודש קודם", use_container_width=True, key="q3"):
+            _quick_q = "מה השתנה מול חודש קודם?"
+    with _qb4:
+        if st.button("👤 עובדים יקרים", use_container_width=True, key="q4"):
+            _quick_q = "מי העובדים עם העלות הגבוהה ביותר?"
+    with _qb5:
+        if st.button("⚠️ חריגות", use_container_width=True, key="q5"):
+            _quick_q = "אילו חריגות קיימות בנתונים?"
+
+    # Chat history
+    if "ai_chat" not in st.session_state:
+        st.session_state.ai_chat = []
+
+    # Chat display
+    if st.session_state.ai_chat:
+        _chat_html = (
+            '<div style="max-height:320px;overflow-y:auto;padding:10px;'
+            'border:1px solid #e5e7eb;border-radius:12px;background:#fff;margin-bottom:10px">'
+        )
+        import html as _hl
+        for _msg in st.session_state.ai_chat:
+            _txt = _hl.escape(str(_msg["content"]))
+            if _msg["role"] == "user":
+                _chat_html += (
+                    f'<div style="float:right;clear:both;background:#1F497D;color:#fff;'
+                    f'padding:8px 14px;border-radius:16px 16px 4px 16px;margin:4px 0;'
+                    f'max-width:75%;direction:rtl">{_txt}</div>'
+                )
+            else:
+                _chat_html += (
+                    f'<div style="float:left;clear:both;background:#f3f4f6;color:#111;'
+                    f'padding:8px 14px;border-radius:16px 16px 16px 4px;margin:4px 0;'
+                    f'max-width:80%;direction:rtl;white-space:pre-wrap">{_txt}</div>'
+                )
+        _chat_html += '<div style="clear:both"></div></div>'
+        st.markdown(_chat_html, unsafe_allow_html=True)
+
+    # Input form
+    with st.form("ai_chat_form", clear_on_submit=True):
+        _ai_in, _ai_btn = st.columns([6, 1])
+        with _ai_in:
+            _user_q = st.text_input(
+                "שאלה", placeholder="מי הלקוח הכי רווחי? מה קרה ב-02-2026?",
+                label_visibility="collapsed",
+            )
+        with _ai_btn:
+            _ai_sub = st.form_submit_button("שלח ➤")
+
+    _ask = _quick_q or (_user_q.strip() if (_ai_sub and _user_q.strip()) else "")
+    if _ask:
+        st.session_state.ai_chat.append({"role": "user", "content": _ask})
+        with st.spinner("מנתח..."):
+            _ans = answer_question(_ask, _ai_df)
+        st.session_state.ai_chat.append({"role": "assistant", "content": _ans})
+        st.rerun()
+
+    if st.session_state.ai_chat:
+        if st.button("🗑️ נקה שיחה", key="clear_ai"):
+            st.session_state.ai_chat = []
+            st.rerun()
+
+    if _ai_df.empty:
+        st.info("חשב חודשים כדי לאפשר שאילתות AI על הנתונים.")
+
+except Exception as _ai_err:
+    st.warning(f"AI assistant לא זמין: {_ai_err}")
+
+# ===========================================================================
+# CLAUDE CHAT (legacy — hidden when AI assistant is available)
 # ===========================================================================
 
 _api_key = os.getenv("ANTHROPIC_API_KEY")
-if _api_key:
+if _api_key and False:   # disabled — replaced by AI assistant above
     st.divider()
     st.markdown('<div class="sec-hdr">💬 שאל את Claude</div>', unsafe_allow_html=True)
     if "chat_history" not in st.session_state: st.session_state.chat_history = []

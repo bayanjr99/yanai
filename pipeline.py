@@ -167,7 +167,8 @@ import re as _re
 
 DATA_ROOT    = os.getenv("DATA_ROOT",   "data")
 OUTPUT_ROOT  = os.getenv("OUTPUT_ROOT", "output")
-# History lives inside DATA_ROOT so it persists on Render's mounted disk
+# History + master dataset live inside DATA_ROOT (persists on Render disk)
+MASTER_PATH  = os.path.join(DATA_ROOT, "master.parquet")
 HISTORY_ROOT = os.path.join(DATA_ROOT, "months")
 
 # Agreements and overrides live at the data/ root (existing convention)
@@ -360,6 +361,103 @@ def load_month_clients(month: str) -> "pd.DataFrame":
         except Exception:
             pass
     return _pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Master dataset  (/data/master.parquet)
+# ---------------------------------------------------------------------------
+
+_MASTER_COLS = {
+    "client":         "client",
+    "employee_id":    "employee_id",
+    "employee_name":  "employee_name",
+    "site":           "site",
+    "total_hours":    "hours",
+    "billing_amount": "billing",
+    "cost":           "cost",
+    "profit":         "profit",
+    "margin_pct":     "margin",
+}
+
+
+def update_master(detail_df: "pd.DataFrame", month: str) -> None:
+    """
+    Upsert month's rows into master.parquet.
+    Old rows for this month are replaced; all other months stay.
+    Safe to call after every pipeline run.
+    """
+    import pandas as _pd
+
+    avail = {k: v for k, v in _MASTER_COLS.items() if v in detail_df.columns}
+    slim  = detail_df[list(avail.values())].copy().rename(columns={v: k for k, v in avail.items()})
+    slim["month"] = month
+
+    if os.path.exists(MASTER_PATH):
+        try:
+            existing = _pd.read_parquet(MASTER_PATH)
+            existing = existing[existing["month"] != month]
+            master   = _pd.concat([existing, slim], ignore_index=True)
+        except Exception:
+            master = slim
+    else:
+        master = slim
+
+    os.makedirs(os.path.dirname(MASTER_PATH) or ".", exist_ok=True)
+    master.to_parquet(MASTER_PATH, index=False)
+
+
+def get_all_data() -> "pd.DataFrame":
+    """Load master.parquet. Returns empty DataFrame if file doesn't exist."""
+    import pandas as _pd
+    if os.path.exists(MASTER_PATH):
+        try:
+            return _pd.read_parquet(MASTER_PATH)
+        except Exception:
+            pass
+    return _pd.DataFrame()
+
+
+def filter_by_month(df: "pd.DataFrame", month: str) -> "pd.DataFrame":
+    if df.empty or "month" not in df.columns:
+        return df
+    return df[df["month"] == month]
+
+
+def filter_by_client(df: "pd.DataFrame", clients) -> "pd.DataFrame":
+    if df.empty or "client" not in df.columns:
+        return df
+    if isinstance(clients, str):
+        clients = [clients]
+    return df[df["client"].isin(clients)]
+
+
+def get_profit_trend(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Return monthly totals: month | billing | profit | cost."""
+    import pandas as _pd
+    if df.empty:
+        return _pd.DataFrame()
+    cols = {c: c for c in ["billing", "profit", "cost", "hours"] if c in df.columns}
+    if "month" not in df.columns or not cols:
+        return _pd.DataFrame()
+    return (
+        df.groupby("month", as_index=False)
+        .agg({c: "sum" for c in cols})
+        .sort_values("month")
+        .rename(columns={"billing": "total_billing", "profit": "total_profit"})
+    )
+
+
+def get_top_clients(df: "pd.DataFrame", n: int = 5) -> "pd.DataFrame":
+    """Return top N clients by total billing across all months in df."""
+    import pandas as _pd
+    if df.empty or "client" not in df.columns or "billing" not in df.columns:
+        return _pd.DataFrame()
+    return (
+        df.groupby("client", as_index=False)
+        .agg(billing=("billing", "sum"), profit=("profit", "sum"))
+        .nlargest(n, "billing")
+        .reset_index(drop=True)
+    )
 
 
 def load_trend_df() -> "pd.DataFrame":
