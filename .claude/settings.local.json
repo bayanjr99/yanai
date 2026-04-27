@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(del temp_compare.json temp_summary.json temp_detail.json temp_comparison.json)",
+      "Bash(python main.py)",
+      "Bash(del \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_run.json\" \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_manual.json\" \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_cmp.json\" \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_pdf_check.json\")",
+      "Bash(del \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_run.json\" \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_sum.json\" \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_cmp.json\" \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_agr.json\" \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_sites.json\")",
+      "Bash(del \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_hours_check.json\")",
+      "Bash(del \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_run.json\" \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\\\\tmp_sum.json\")",
+      "Bash(python test_e2e.py)",
+      "Bash(dir \"C:\\\\Users\\\\Administrator\\\\Meylon\\\\Meylon - מסמכים\\\\ביאן - הנהחש ולקוחות\\\\billing_system\" /b)",
+      "Bash(python -c \"from core.analytics import load_history, standardize, kpi_summary, compare_months, dashboard_table, detect_anomalies, batch_process_pdfs; print\\('OK'\\)\")",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py syntax OK'\\)\")",
+      "Bash(streamlit run *)",
+      "PowerShell(Get-Process | Where-Object { $_.Name -match \"python|streamlit\" } | Select-Object Id, Name, CPU)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501)",
+      "Bash([ -f \"$SRC\" ])",
+      "Bash([ ! -f \"$DEST\" ])",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py OK'\\)\")"
+    ]
+  }
+}

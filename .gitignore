@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+
+# Virtual environments
+venv/
+env/
+.env
+.venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Database
+*.db
+*.sqlite3
+
+# Output / sessions (runtime data, not source)
+output/
+sessions/
+uploads/
+build/
+history/
+
+# Data files — real payroll PDFs and Excel sheets (private business data)
+data/**/*.pdf
+data/**/*.xlsx
+data/**/*.xls
+data/agreements.xlsx
+data/employees_cost.xlsx
+data/overrides.xlsx
+# Keep folder structure but not content
+!data/.gitkeep
+!data/agreements/.gitkeep
+
+# Temp / debug files
+tmp*.json
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Secrets
+.env
+*.env
+secrets.toml
