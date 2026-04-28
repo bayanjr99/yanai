@@ -23,10 +23,11 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from pipeline import (
-    DATA_ROOT, MASTER_PATH, MASTER_XLSX,
+    DATA_ROOT, MASTER_PATH, MASTER_XLSX, CALENDAR_XLSX,
     list_available_months,
     build_master_full,
     build_summary_tables,
+    build_calendar,
     validate_master,
     get_all_data,
 )
@@ -119,6 +120,10 @@ def run(data_root: str = DATA_ROOT, onedrive_path: str | None = None) -> int:
     summaries_path = os.path.join(data_root, "summaries.xlsx")
     if os.path.exists(summaries_path):
         _log(f"Saved: {os.path.abspath(summaries_path)}")
+
+    if os.path.exists(CALENDAR_XLSX):
+        cal = build_calendar(master)
+        _log(f"Saved: {os.path.abspath(CALENDAR_XLSX)}  ({len(cal):,} days, {cal['year'].nunique() if not cal.empty else 0} years)")
 
     # ── Optional OneDrive copy ────────────────────────────────────────────────
     if onedrive_path:

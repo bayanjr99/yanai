@@ -30,9 +30,10 @@ from core.billing_engine import calculate
 # Config
 # ---------------------------------------------------------------------------
 
-DATA_ROOT    = os.getenv("DATA_ROOT", "data")
-MASTER_PATH  = os.path.join(DATA_ROOT, "master_full.parquet")
-MASTER_XLSX  = os.path.join(DATA_ROOT, "master_full.xlsx")
+DATA_ROOT     = os.getenv("DATA_ROOT", "data")
+MASTER_PATH   = os.path.join(DATA_ROOT, "master_full.parquet")
+MASTER_XLSX   = os.path.join(DATA_ROOT, "master_full.xlsx")
+CALENDAR_XLSX = os.path.join(DATA_ROOT, "calendar.xlsx")
 
 _AGREEMENTS_CANDIDATES = [
     os.path.join(DATA_ROOT, "agreements.xlsx"),
@@ -51,14 +52,17 @@ _RENAME_MAP = {
     "margin_pct":     "margin",
 }
 
-# Canonical master schema — exact order for Power BI
+# Canonical master schema — exact order for Power BI fact table
 _MASTER_SCHEMA = [
+    "row_id",
     "month", "date", "year",
     "client", "site",
     "employee_id", "employee_name",
     "days", "hours",
     "billing", "cost", "profit", "margin",
     "profit_per_hour", "cost_per_hour", "revenue_per_hour",
+    "profit_per_employee", "profit_per_client",
+    "completion_added",
 ]
 
 
@@ -662,7 +666,7 @@ def _clean_master(df: pd.DataFrame) -> pd.DataFrame:
     if "client" in df.columns:
         df = df[df["client"].notna() & (df["client"].astype(str).str.strip() != "")]
 
-    # 6. Fill nulls
+    # 6. Fill numeric nulls with 0; string nulls with ""
     num_cols = ["days", "hours", "billing", "cost", "profit", "margin",
                 "profit_per_hour", "cost_per_hour", "revenue_per_hour"]
     for col in num_cols:
@@ -673,15 +677,35 @@ def _clean_master(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str).str.strip()
 
-    # 7. Drop duplicates (keep last — most recently computed wins)
+    # 7. Drop duplicates on natural key (keep last — most recently computed wins)
     key_cols = [c for c in ("month", "employee_id", "site") if c in df.columns]
     if key_cols:
         df = df.drop_duplicates(subset=key_cols, keep="last")
 
-    # 8. Reorder: canonical schema first, extra columns at end
+    df = df.reset_index(drop=True)
+
+    # 8. Grouped profit metrics (transform = per-row context for Power BI slicing)
+    if "employee_name" in df.columns and "profit" in df.columns:
+        df["profit_per_employee"] = (
+            df.groupby("employee_name")["profit"].transform("sum").round(2)
+        )
+    else:
+        df["profit_per_employee"] = 0.0
+
+    if "client" in df.columns and "profit" in df.columns:
+        df["profit_per_client"] = (
+            df.groupby("client")["profit"].transform("sum").round(2)
+        )
+    else:
+        df["profit_per_client"] = 0.0
+
+    # 9. Row ID — unique integer key for Power BI relationships
+    df.insert(0, "row_id", range(len(df)))
+
+    # 10. Reorder: canonical schema first, keep any extra columns at end
     ordered = [c for c in _MASTER_SCHEMA if c in df.columns]
     extra   = [c for c in df.columns if c not in _MASTER_SCHEMA]
-    df = df[ordered + extra].reset_index(drop=True)
+    df = df[ordered + extra]
 
     return df
 
@@ -701,6 +725,54 @@ def _save_master_xlsx(master: pd.DataFrame) -> None:
         export.sort_values(sort_cols, inplace=True, ignore_index=True)
 
     export.to_excel(MASTER_XLSX, index=False, sheet_name="master_full")
+
+
+def build_calendar(master: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a calendar dimension table spanning the full date range of master.
+    Returns one row per day with standard BI time-intelligence columns.
+
+    Columns: date, year, month, month_name, month_name_he, quarter,
+             week_of_year, year_month, day_of_week, is_weekend
+    """
+    if "date" not in master.columns or master["date"].isna().all():
+        return pd.DataFrame()
+
+    min_dt = pd.to_datetime(master["date"].dropna().min())
+    max_dt = pd.to_datetime(master["date"].dropna().max())
+
+    # Extend to full calendar years so Power BI time-intelligence works
+    min_dt = min_dt.replace(month=1, day=1)
+    max_dt = max_dt.replace(month=12, day=31)
+
+    dates = pd.date_range(start=min_dt, end=max_dt, freq="D")
+    cal   = pd.DataFrame({"date": dates})
+
+    cal["year"]         = cal["date"].dt.year
+    cal["month"]        = cal["date"].dt.month
+    cal["month_name"]   = cal["date"].dt.strftime("%B")          # English
+    cal["month_name_he"] = cal["date"].dt.month.map({            # Hebrew
+        1: "ינואר", 2: "פברואר", 3: "מרץ",   4: "אפריל",
+        5: "מאי",   6: "יוני",   7: "יולי",  8: "אוגוסט",
+        9: "ספטמבר",10: "אוקטובר",11: "נובמבר",12: "דצמבר",
+    })
+    cal["quarter"]      = cal["date"].dt.quarter
+    cal["week_of_year"] = cal["date"].dt.isocalendar().week.astype(int)
+    cal["year_month"]   = cal["date"].dt.strftime("%Y-%m")       # e.g. 2025-02
+    cal["day_of_week"]  = cal["date"].dt.day_name()
+    cal["is_weekend"]   = cal["date"].dt.dayofweek >= 5
+
+    # Store date as string so Excel renders it correctly
+    cal["date"] = cal["date"].dt.strftime("%Y-%m-%d")
+
+    return cal
+
+
+def _save_calendar(master: pd.DataFrame) -> None:
+    """Write calendar.xlsx — date dimension table for Power BI."""
+    cal = build_calendar(master)
+    if not cal.empty:
+        cal.to_excel(CALENDAR_XLSX, index=False, sheet_name="calendar")
 
 
 def build_master_full(data_root: str = DATA_ROOT) -> tuple[pd.DataFrame, list[str]]:
@@ -755,6 +827,12 @@ def build_master_full(data_root: str = DATA_ROOT) -> tuple[pd.DataFrame, list[st
     except Exception as e:
         errors.append(f"summary tables error: {e}")
 
+    # Save calendar dimension
+    try:
+        _save_calendar(master)
+    except Exception as e:
+        errors.append(f"calendar error: {e}")
+
     return master, errors
 
 
@@ -785,34 +863,61 @@ def update_master(detail_df: pd.DataFrame, month: str) -> None:
         _save_summary_tables(master)
     except Exception:
         pass
+    try:
+        _save_calendar(master)
+    except Exception:
+        pass
 
 
 def validate_master(master: pd.DataFrame) -> list[str]:
     """
-    Validate master dataset. Returns list of warning strings (non-fatal).
+    Validate master dataset for Power BI readiness.
+    Returns list of warning strings (all non-fatal).
     """
     warnings: list[str] = []
 
-    required = ["month", "client", "billing", "cost", "profit"]
+    # 1. Required columns
+    required = ["row_id", "month", "date", "year", "client", "billing", "cost", "profit"]
     missing  = [c for c in required if c not in master.columns]
     if missing:
         warnings.append(f"עמודות חסרות: {', '.join(missing)}")
-        return warnings  # can't do further checks
+        return warnings
 
+    # 2. Duplicate row_id (breaks Power BI relationships)
+    if master["row_id"].duplicated().any():
+        warnings.append(
+            f"{master['row_id'].duplicated().sum()} כפולות ב-row_id — "
+            "Power BI relationships ייכשלו"
+        )
+
+    # 3. Null dates (breaks time intelligence)
+    null_dates = master["date"].isna().sum()
+    if null_dates:
+        warnings.append(
+            f"{null_dates} שורות ללא תאריך — Time Intelligence ב-Power BI תיפגע"
+        )
+
+    # 4. Null clients
     null_clients = master["client"].isna() | (master["client"].astype(str).str.strip() == "")
     if null_clients.any():
         warnings.append(f"{null_clients.sum()} שורות ללא לקוח הוסרו מ-Master")
 
-    # Cost > 2× billing is usually a data error
+    # 5. Non-numeric in numeric columns
+    for col in ("billing", "cost", "profit", "hours"):
+        if col in master.columns:
+            bad = pd.to_numeric(master[col], errors="coerce").isna().sum()
+            if bad:
+                warnings.append(f"{bad} ערכים לא-מספריים בעמודה '{col}'")
+
+    # 6. Cost > 2× billing (data integrity)
     suspicious = master[(master["billing"] > 0) & (master["cost"] > master["billing"] * 2)]
     if not suspicious.empty:
         warnings.append(
             f"{len(suspicious)} שורות עם עלות > 2× חיוב — בדוק נתונים"
         )
 
-    # Warn if no month has any billing
-    zero_billing = master[master["billing"] == 0]
-    if len(zero_billing) == len(master):
+    # 7. All-zero billing
+    if (master["billing"] == 0).all():
         warnings.append("כל שורות המאסטר עם חיוב 0 — בדוק הסכמים")
 
     return warnings
