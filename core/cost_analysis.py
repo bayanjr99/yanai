@@ -181,14 +181,23 @@ def merge_and_allocate(
     month: str,
 ) -> pd.DataFrame:
     """
-    Join hours and costs on employee_id.
-    Allocate employer_cost across sites proportionally to hours worked.
+    Join hours and costs by employee_id and allocate cost across sites.
 
-    Rule:
-      allocated_cost(site) = employer_cost × (site_hours / total_hours)
-      cost_per_hour(site)  = allocated_cost / site_hours   (0 if hours == 0)
+    Algorithm
+    ---------
+    1. Aggregate total hours per employee (across ALL sites this month).
+    2. Calculate cost_per_hour = employer_cost / emp_total_hours  (employee level).
+    3. For each site row: allocated_cost = site_hours × cost_per_hour.
 
-    Never joins on employee_name.
+    The employer_cost in costs_df is already summed per employee_id by
+    load_costs_xlsx() (one employee can appear in multiple cost rows for
+    different client/site assignments — their total is the sum).
+
+    Hours rows are kept as-is: one row per (employee × site).
+    Employees with costs but no hours are excluded (left join on hours).
+    Employees with hours but no costs get employer_cost = 0.
+
+    Never uses employee_name for any join.
     """
     if hours_df.empty:
         return pd.DataFrame()
@@ -199,38 +208,40 @@ def merge_and_allocate(
     h["employee_id"] = h["employee_id"].astype(str).str.strip()
     c["employee_id"] = c["employee_id"].astype(str).str.strip()
 
-    # Total hours per employee (across all sites this month)
+    # Step 1: total hours per employee across all sites
     emp_totals = (
         h.groupby("employee_id", as_index=False)["total_hours"]
         .sum()
         .rename(columns={"total_hours": "emp_total_hours"})
     )
 
-    # costs_df is already deduplicated + summed by load_costs_xlsx()
-    # Left join: employees in hours but NOT in costs get employer_cost = 0
-    # Employees in costs but NOT in hours are excluded (left join on hours)
+    # Left join: all hour rows kept; missing cost rows → employer_cost = 0
     merged = (
         h
         .merge(emp_totals, on="employee_id", how="left")
         .merge(
             c[["employee_id", "employer_cost", "client"]],
             on="employee_id",
-            how="left",          # keeps all hour rows; missing cost → NaN → 0
+            how="left",
         )
     )
     merged["employer_cost"] = merged["employer_cost"].fillna(0.0)
 
-    # Allocate employer_cost across sites by hours ratio
+    # Step 2: cost_per_hour is an employee-level metric
+    #   = employer_cost / total_hours_for_employee
+    #   same value for all site rows belonging to the same employee
     _safe_total = merged["emp_total_hours"].replace(0, float("nan"))
+    merged["cost_per_hour"] = (
+        merged["employer_cost"] / _safe_total
+    ).round(4).fillna(0.0)     # full precision before allocation
+
+    # Step 3: allocated_cost = site_hours × cost_per_hour
     merged["allocated_cost"] = (
-        merged["employer_cost"] * merged["total_hours"] / _safe_total
+        merged["total_hours"] * merged["cost_per_hour"]
     ).round(2).fillna(0.0)
 
-    # Cost per hour at site level (safe: 0 when hours = 0)
-    _safe_hours = merged["total_hours"].replace(0, float("nan"))
-    merged["cost_per_hour"] = (
-        merged["allocated_cost"] / _safe_hours
-    ).round(2).fillna(0.0)
+    # Round cost_per_hour for display (2 decimal places)
+    merged["cost_per_hour"] = merged["cost_per_hour"].round(2)
 
     merged["month"] = month
 
@@ -373,6 +384,24 @@ def detect_warnings(
                 str(r["employee_id"]),
                 f"High cost_per_hour ₪{r['cost_per_hour']:.0f}/h "
                 f"(threshold ₪{cost_per_hour_threshold:.0f}/h)",
+            )
+
+        # 4. Allocation validation: sum(allocated_cost) per employee must equal employer_cost
+        alloc_check = (
+            merged.groupby("employee_id", as_index=False)
+            .agg(sum_allocated=("allocated_cost", "sum"),
+                 employer_cost =("employer_cost",  "first"))
+        )
+        alloc_check["diff"] = (
+            alloc_check["sum_allocated"] - alloc_check["employer_cost"]
+        ).abs()
+        mismatch = alloc_check[alloc_check["diff"] > 0.05]
+        for _, r in mismatch.iterrows():
+            _warn(
+                str(r["employee_id"]),
+                f"Allocation mismatch: sum(allocated) ₪{r['sum_allocated']:,.2f} "
+                f"≠ employer_cost ₪{r['employer_cost']:,.2f} "
+                f"(diff ₪{r['diff']:,.2f})",
             )
 
     df = pd.DataFrame(rows, columns=["month", "employee_id", "issue"])
