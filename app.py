@@ -19,12 +19,11 @@ except ImportError:
 
 from pipeline import (
     run_month_pipeline, build_master_full, list_available_months,
-    month_file_mtime, update_master, get_all_data,
-    filter_by_client, get_profit_trend, get_top_clients, get_top_employees,
-    DATA_ROOT, MASTER_PATH, MASTER_XLSX,
+    month_file_mtime, update_master, get_all_data, filter_by_client,
+    get_profit_trend, get_top_clients, get_top_employees, build_summary_tables,
+    validate_master, DATA_ROOT, MASTER_PATH, MASTER_XLSX,
 )
 from core.validation import ValidationError
-from core.analytics import kpi_summary, dashboard_table, insights_engine
 
 # ===========================================================================
 # PAGE CONFIG + GLOBAL CSS
@@ -93,13 +92,15 @@ _PL = dict(margin=dict(l=0, r=0, t=8, b=0), paper_bgcolor="white",
 
 
 def _line_trend(df: pd.DataFrame):
+    """Trend chart — works on get_profit_trend() output (clean column names)."""
     if not _PLOTLY or df.empty or "month" not in df.columns:
         return None
     fig = go.Figure()
+    # billing / profit / cost are the clean column names from get_profit_trend()
     color_map = {
-        "billing_amount": ("#1F497D", "חיוב", True),
-        "profit":         ("#16a34a", "רווח", False),
-        "cost":           ("#dc2626", "עלות", False),
+        "billing": ("#1F497D", "חיוב", True),
+        "profit":  ("#16a34a", "רווח", False),
+        "cost":    ("#dc2626", "עלות", False),
     }
     for col, (color, name, fill) in color_map.items():
         if col not in df.columns:
@@ -112,37 +113,34 @@ def _line_trend(df: pd.DataFrame):
     fig.update_layout(**{**_PL, "showlegend": True}, height=270,
                       legend=dict(orientation="h", y=1.1),
                       xaxis=dict(showgrid=False, tickangle=-30),
-                      yaxis=dict(showgrid=True, gridcolor="#f3f4f6",
-                                 tickformat="₪,.0f"))
+                      yaxis=dict(showgrid=True, gridcolor="#f3f4f6", tickformat="₪,.0f"))
     return fig
 
 
-def _bar_h(df: pd.DataFrame, x_col: str, y_col: str, color: str = "#1F497D", title_fmt: str = "₪{:,.0f}"):
-    if not _PLOTLY or df.empty:
+def _bar_h(df: pd.DataFrame, x_col: str, y_col: str, color: str = "#1F497D"):
+    if not _PLOTLY or df.empty or x_col not in df.columns or y_col not in df.columns:
         return None
     d = df.sort_values(x_col, ascending=True).tail(10)
     fig = px.bar(d, x=x_col, y=y_col, orientation="h",
                  color_discrete_sequence=[color], labels={x_col: "₪", y_col: ""})
     fig.update_layout(**_PL, height=max(180, len(d) * 32))
-    fig.update_traces(texttemplate=f"₪%{{x:,.0f}}", textposition="outside")
-    fig.update_xaxes(visible=False)
-    fig.update_yaxes(showgrid=False)
+    fig.update_traces(texttemplate="₪%{x:,.0f}", textposition="outside")
+    fig.update_xaxes(visible=False); fig.update_yaxes(showgrid=False)
     return fig
 
 
 def _bar_clients(df: pd.DataFrame):
-    if not _PLOTLY or df.empty or "client" not in df.columns or "billing_amount" not in df.columns:
+    """Top clients bar — expects 'billing' column (clean master schema)."""
+    if not _PLOTLY or df.empty or "client" not in df.columns:
         return None
-    return _bar_h(df, "billing_amount", "client", "#1F497D")
+    col = "billing" if "billing" in df.columns else "billing_amount"
+    return _bar_h(df, col, "client", "#1F497D")
 
 
 def _bar_clients_profit(df: pd.DataFrame):
-    if not _PLOTLY or df.empty:
+    if not _PLOTLY or df.empty or "profit" not in df.columns or "client" not in df.columns:
         return None
-    d = df.sort_values("billing_amount").copy()
-    if "profit" not in d.columns:
-        return None
-    d = d.sort_values("profit")
+    d = df.sort_values("profit").copy()
     d["_c"] = d["profit"].apply(lambda x: "#16a34a" if x >= 0 else "#dc2626")
     fig = px.bar(d, x="profit", y="client", orientation="h",
                  color="_c", color_discrete_map={c: c for c in d["_c"].unique()},
@@ -160,8 +158,12 @@ def _bar_employees(df: pd.DataFrame):
     return _bar_h(df, col, "employee_name", "#7c3aed")
 
 
-def _pie(df: pd.DataFrame, col: str = "billing_amount"):
-    if not _PLOTLY or df.empty or "client" not in df.columns or col not in df.columns:
+def _pie(df: pd.DataFrame):
+    """Revenue pie — uses 'billing' (clean schema) or 'billing_amount' as fallback."""
+    if not _PLOTLY or df.empty or "client" not in df.columns:
+        return None
+    col = "billing" if "billing" in df.columns else ("billing_amount" if "billing_amount" in df.columns else None)
+    if col is None:
         return None
     d = df.groupby("client")[col].sum().nlargest(8).reset_index()
     fig = px.pie(d, values=col, names="client", hole=0.4,
@@ -235,20 +237,28 @@ def _load_master_cached() -> pd.DataFrame:
 
 
 def _answers_with_pandas(df: pd.DataFrame, question: str) -> str | None:
-    """Try to answer simple questions using pandas before calling AI."""
+    """Answer simple questions using pandas (master uses clean column names)."""
     q = question.strip().lower()
-    if not df.empty and "client" in df.columns and "billing_amount" in df.columns:
-        top_client = df.groupby("client")["billing_amount"].sum().idxmax()
-        if any(w in q for w in ["רווחי", "הכי רווחי", "top client", "best client"]):
-            b = df.groupby("client")["billing_amount"].sum()[top_client]
-            p = df.groupby("client")["profit"].sum()[top_client] if "profit" in df.columns else 0
-            return f"הלקוח הכי רווחי: **{top_client}** — חיוב ₪{b:,.0f}, רווח ₪{p:,.0f}"
-        if any(w in q for w in ["כמה חודשים", "חודשים"]) and "month" in df.columns:
-            return f"יש {df['month'].nunique()} חודשים בנתונים: {', '.join(sorted(df['month'].unique()))}"
-        if any(w in q for w in ["עובד", "עלות עובד"]) and "employee_name" in df.columns:
-            top_emp = df.groupby("employee_name")["cost"].sum().idxmax() if "cost" in df.columns else "—"
-            c = df.groupby("employee_name")["cost"].sum()[top_emp] if "cost" in df.columns else 0
+    if df.empty or "client" not in df.columns:
+        return None
+    if "billing" in df.columns:
+        try:
+            top_client = df.groupby("client")["billing"].sum().idxmax()
+            if any(w in q for w in ["רווחי", "הכי רווחי", "top client", "best client"]):
+                b = float(df.groupby("client")["billing"].sum()[top_client])
+                p = float(df.groupby("client")["profit"].sum()[top_client]) if "profit" in df.columns else 0
+                return f"הלקוח הכי רווחי: **{top_client}** — חיוב ₪{b:,.0f}, רווח ₪{p:,.0f}"
+        except Exception:
+            pass
+    if any(w in q for w in ["כמה חודשים", "חודשים"]) and "month" in df.columns:
+        return f"יש {df['month'].nunique()} חודשים: {', '.join(sorted(df['month'].unique()))}"
+    if any(w in q for w in ["עובד", "עלות עובד"]) and "employee_name" in df.columns and "cost" in df.columns:
+        try:
+            top_emp = df.groupby("employee_name")["cost"].sum().idxmax()
+            c = float(df.groupby("employee_name")["cost"].sum()[top_emp])
             return f"העובד היקר ביותר: **{top_emp}** — עלות ₪{c:,.0f}"
+        except Exception:
+            pass
     return None
 
 
@@ -500,7 +510,7 @@ if f_emp and "employee_name" in master.columns:
     master = master[master["employee_name"].isin(f_emp)]
 
 # ===========================================================================
-# SECTION A — KPI BAR
+# SECTION A — KPI BAR  (uses clean master column names)
 # ===========================================================================
 
 st.markdown('<div class="sec-hdr">📈 KPIs</div>', unsafe_allow_html=True)
@@ -509,30 +519,33 @@ if master.empty:
     st.warning("אין נתונים לפי הסינון שנבחר")
     st.stop()
 
-_kpis   = kpi_summary(master)
-_margin = (_kpis["total_profit"] / _kpis["total_billing"] * 100
-           if _kpis["total_billing"] > 0 else 0.0)
-_pcls   = "green" if _kpis["total_profit"] >= 0 else "red"
-_mcls   = "green" if _margin >= 10 else "red"
+_total_billing  = float(master["billing"].sum()) if "billing" in master.columns else 0.0
+_total_cost     = float(master["cost"].sum())    if "cost"    in master.columns else 0.0
+_total_profit   = float(master["profit"].sum())  if "profit"  in master.columns else 0.0
+_total_hours    = float(master["hours"].sum())   if "hours"   in master.columns else 0.0
+_margin_overall = (_total_profit / _total_billing * 100) if _total_billing > 0 else 0.0
+_pcls = "green" if _total_profit >= 0 else "red"
+_mcls = "green" if _margin_overall >= 10 else "red"
 
-# vs previous period comparison (last month in filtered range)
+# Trend for delta badges
 _trend_df = get_profit_trend(master)
 _prev_b = _prev_p = 0.0
+_cur_b  = _total_billing
+_cur_p  = _total_profit
 if len(_trend_df) >= 2:
-    _prev_row = _trend_df.iloc[-2]
-    _prev_b   = float(_prev_row.get("billing_amount", 0))
-    _prev_p   = float(_prev_row.get("profit", 0))
-_cur_b = float(_trend_df.iloc[-1].get("billing_amount", 0)) if not _trend_df.empty else _kpis["total_billing"]
-_cur_p = float(_trend_df.iloc[-1].get("profit", 0)) if not _trend_df.empty else _kpis["total_profit"]
+    _prev_b = float(_trend_df.iloc[-2].get("billing", 0))
+    _prev_p = float(_trend_df.iloc[-2].get("profit",  0))
+    _cur_b  = float(_trend_df.iloc[-1].get("billing", _total_billing))
+    _cur_p  = float(_trend_df.iloc[-1].get("profit",  _total_profit))
 
 k1, k2, k3, k4 = st.columns(4)
-for _col, lbl, val, cls, delta_cur, delta_prev in [
-    (k1, "💰 חיוב כולל",  f'₪{_kpis["total_billing"]:,.0f}', "", _cur_b, _prev_b),
-    (k2, "📤 עלות כוללת", f'₪{_kpis["total_cost"]:,.0f}',    "", 0, 0),
-    (k3, "📈 רווח כולל",  f'₪{_kpis["total_profit"]:,.0f}',  _pcls, _cur_p, _prev_p),
-    (k4, "% מרג'ין",      f'{_margin:.1f}%',                  _mcls, 0, 0),
+for _col, lbl, val, cls, dc, dp in [
+    (k1, "💰 חיוב כולל",  f"₪{_total_billing:,.0f}",  "",    _cur_b, _prev_b),
+    (k2, "📤 עלות כוללת", f"₪{_total_cost:,.0f}",      "",    0, 0),
+    (k3, "📈 רווח כולל",  f"₪{_total_profit:,.0f}",    _pcls, _cur_p, _prev_p),
+    (k4, "% מרג'ין",      f"{_margin_overall:.1f}%",   _mcls, 0, 0),
 ]:
-    badge = _pct_badge(delta_cur, delta_prev) if delta_prev else ""
+    badge = _pct_badge(dc, dp) if dp else ""
     with _col:
         st.markdown(
             f'<div class="kpi-card">'
@@ -545,23 +558,20 @@ for _col, lbl, val, cls, delta_cur, delta_prev in [
 
 st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-# Last-calculated month quick stats
+# Last-calculated month bar
 _last_m = st.session_state.get("last_month", "")
 if _last_m and "month" in master.columns and _last_m in master["month"].values:
     _lm_df = master[master["month"] == _last_m]
-    _lm_b  = float(_lm_df["billing_amount"].sum()) if "billing_amount" in _lm_df.columns else 0
-    _lm_p  = float(_lm_df["profit"].sum()) if "profit" in _lm_df.columns else 0
+    _lm_b  = float(_lm_df["billing"].sum()) if "billing" in _lm_df.columns else 0
+    _lm_p  = float(_lm_df["profit"].sum())  if "profit"  in _lm_df.columns else 0
     _prev  = _prev_month(_last_m)
     _prev_row_m = master[master["month"] == _prev] if _prev and _prev in master["month"].values else pd.DataFrame()
-    _pb_m = float(_prev_row_m["billing_amount"].sum()) if not _prev_row_m.empty and "billing_amount" in _prev_row_m.columns else 0
-    _pp_m = float(_prev_row_m["profit"].sum()) if not _prev_row_m.empty and "profit" in _prev_row_m.columns else 0
+    _pb_m = float(_prev_row_m["billing"].sum()) if not _prev_row_m.empty and "billing" in _prev_row_m.columns else 0
+    _pp_m = float(_prev_row_m["profit"].sum())  if not _prev_row_m.empty and "profit"  in _prev_row_m.columns else 0
     _issues_last = st.session_state.get("last_issues", pd.DataFrame())
-    _ni = len(_issues_last) if _issues_last is not None and not (isinstance(_issues_last, pd.DataFrame) and _issues_last.empty) else 0
-
-    prev_txt = ""
-    if _pb_m:
-        prev_txt = (f' &nbsp;|&nbsp; vs {_prev}: חיוב {_pct_badge(_lm_b,_pb_m)} '
-                    f'רווח {_pct_badge(_lm_p,_pp_m)}')
+    _ni = len(_issues_last) if isinstance(_issues_last, pd.DataFrame) and not _issues_last.empty else 0
+    prev_txt = (f' &nbsp;|&nbsp; vs {_prev}: חיוב {_pct_badge(_lm_b,_pb_m)} רווח {_pct_badge(_lm_p,_pp_m)}'
+                if _pb_m else "")
     st.markdown(
         f'<div class="comp-bar">📅 <b>{_last_m}</b>: '
         f'חיוב ₪{_lm_b:,.0f} · רווח ₪{_lm_p:,.0f}'
@@ -580,7 +590,6 @@ if _PLOTLY:
     top_cl  = get_top_clients(master)
     top_emp = get_top_employees(master)
 
-    # Row 1: trend + pie
     r1a, r1b = st.columns([3, 2])
     with r1a:
         st.caption("מגמת הכנסות, רווח ועלות לפי חודש")
@@ -589,29 +598,25 @@ if _PLOTLY:
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         else:
             st.info("נדרש לפחות חודש אחד")
-
     with r1b:
         st.caption("חלוקת הכנסות — לקוחות")
         fig = _pie(master)
         if fig:
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    # Row 2: top clients bar + top employees cost
     r2a, r2b = st.columns(2)
     with r2a:
         st.caption("לקוחות מובילים — חיוב")
         fig = _bar_clients(top_cl)
         if fig:
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
     with r2b:
         st.caption("עובדים — עלות מעביד")
         fig = _bar_employees(top_emp)
         if fig:
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    # Row 3: profit by client
-    r3a, r3b = st.columns(2)
+    r3a, _ = st.columns(2)
     with r3a:
         st.caption("רווח לפי לקוח")
         fig = _bar_clients_profit(top_cl)
@@ -626,57 +631,50 @@ else:
 
 st.markdown('<div class="sec-hdr">📋 רווחיות לפי לקוח</div>', unsafe_allow_html=True)
 
-_dash = dashboard_table(master)
-if not _dash.empty:
-    _dd = _dash.drop(columns=[c for c in ["billing_change_pct", "profit_change_pct"] if c in _dash.columns], errors="ignore")
-    _hours_by_client = (
-        master.groupby("client")["total_hours"].sum()
-        if "total_hours" in master.columns else pd.Series(dtype=float)
+# Aggregate from master (clean column names)
+if "client" in master.columns and "billing" in master.columns:
+    _client_tbl = master.groupby("client", as_index=False).agg(
+        hours  =("hours",   "sum"),
+        billing=("billing", "sum"),
+        cost   =("cost",    "sum"),
+        profit =("profit",  "sum"),
+    ).sort_values("billing", ascending=False)
+    _client_tbl["margin"] = (
+        _client_tbl["profit"] / _client_tbl["billing"].replace(0, float("nan")) * 100
+    ).round(1).fillna(0.0)
+    _client_tbl["קטגוריה"] = _client_tbl["margin"].apply(
+        lambda m: "HIGH" if m > 30 else "MEDIUM" if m >= 10 else "LOW" if m >= 0 else "LOSS"
     )
-    if not _hours_by_client.empty:
-        _dd["total_hours"] = _dd["client"].map(_hours_by_client).fillna(0)
-
-    _dd = _dd.rename(columns={
-        "client":         "לקוח",
-        "total_hours":    "שעות",
-        "billing_amount": "חיוב ₪",
-        "cost":           "עלות ₪",
-        "profit":         "רווח ₪",
-        "margin_pct":     "% מרג'ין",
-        "category":       "קטגוריה",
+    _ct_disp = _client_tbl.rename(columns={
+        "client": "לקוח", "hours": "שעות", "billing": "חיוב ₪",
+        "cost": "עלות ₪", "profit": "רווח ₪", "margin": "% מרג'ין",
     })
-    _show_cols = [c for c in ["לקוח", "שעות", "חיוב ₪", "עלות ₪", "רווח ₪", "% מרג'ין", "קטגוריה"]
-                  if c in _dd.columns]
+    _show = [c for c in ["לקוח", "שעות", "חיוב ₪", "עלות ₪", "רווח ₪", "% מרג'ין", "קטגוריה"]
+             if c in _ct_disp.columns]
     st.dataframe(
-        _dd[_show_cols].style
-        .format({
-            "שעות": "{:.1f}", "חיוב ₪": "₪{:,.0f}",
-            "עלות ₪": "₪{:,.0f}", "רווח ₪": "₪{:,.0f}", "% מרג'ין": "{:.1f}%",
-        })
-        .applymap(_scat, subset=["קטגוריה"] if "קטגוריה" in _dd.columns else []),
+        _ct_disp[_show].style
+        .format({"שעות": "{:.1f}", "חיוב ₪": "₪{:,.0f}",
+                 "עלות ₪": "₪{:,.0f}", "רווח ₪": "₪{:,.0f}", "% מרג'ין": "{:.1f}%"})
+        .applymap(_scat, subset=["קטגוריה"]),
         use_container_width=True, hide_index=True,
     )
 
-# Drill-down by employee (expandable)
+# Employee drill-down
 with st.expander("🔍 פירוט לפי עובד"):
-    if "employee_name" in master.columns:
-        _emp_tbl = (
-            master.groupby(["employee_name", "client"], as_index=False)
-            .agg(
-                total_hours   =("total_hours",    "sum"),
-                billing_amount=("billing_amount", "sum"),
-                cost          =("cost",           "sum"),
-                profit        =("profit",         "sum"),
-            )
+    if "employee_name" in master.columns and "billing" in master.columns:
+        _emp_tbl = master.groupby(["employee_name", "client"], as_index=False).agg(
+            hours  =("hours",   "sum"),
+            billing=("billing", "sum"),
+            cost   =("cost",    "sum"),
+            profit =("profit",  "sum"),
         )
-        _emp_tbl["margin_pct"] = (
-            _emp_tbl["profit"] / _emp_tbl["billing_amount"].replace(0, float("nan")) * 100
-        ).round(1)
-        _emp_tbl = _emp_tbl.sort_values("billing_amount", ascending=False).reset_index(drop=True)
+        _emp_tbl["margin"] = (
+            _emp_tbl["profit"] / _emp_tbl["billing"].replace(0, float("nan")) * 100
+        ).round(1).fillna(0.0)
+        _emp_tbl = _emp_tbl.sort_values("billing", ascending=False).reset_index(drop=True)
         _emp_tbl = _emp_tbl.rename(columns={
-            "employee_name": "עובד", "client": "לקוח",
-            "total_hours": "שעות", "billing_amount": "חיוב ₪",
-            "cost": "עלות ₪", "profit": "רווח ₪", "margin_pct": "% מרג'ין",
+            "employee_name": "עובד", "client": "לקוח", "hours": "שעות",
+            "billing": "חיוב ₪", "cost": "עלות ₪", "profit": "רווח ₪", "margin": "% מרג'ין",
         })
         st.dataframe(
             _emp_tbl.style.format({
@@ -692,41 +690,51 @@ with st.expander("🔍 פירוט לפי עובד"):
 
 st.markdown('<div class="sec-hdr">⚠️ התראות</div>', unsafe_allow_html=True)
 
-_ins_df  = insights_engine(master)
 _alerts: list[tuple[str, str]] = []
 
 # 1. Negative profit clients
-if not _ins_df.empty and "profit" in _ins_df.columns:
-    _loss = _ins_df[_ins_df["profit"] < 0]
+if "client" in master.columns and "profit" in master.columns:
+    _by_client = master.groupby("client")[["billing", "profit", "margin"]].sum()
+    _loss = _by_client[_by_client["profit"] < 0]
     if not _loss.empty:
-        _names = ", ".join(_loss["client"].tolist())
-        _tot   = float(_loss["profit"].sum())
-        _alerts.append(("error", f"❌ לקוחות בהפסד ({len(_loss)}): {_names} — סה\"כ ₪{_tot:,.0f}"))
+        _tot = float(_loss["profit"].sum())
+        _alerts.append(("error",
+            f"❌ לקוחות בהפסד ({len(_loss)}): {', '.join(_loss.index.tolist())} — "
+            f'סה"כ ₪{_tot:,.0f}'))
 
-# 2. Low margin clients (<10%)
-if not _ins_df.empty and "margin_pct" in _ins_df.columns:
-    _low = _ins_df[(_ins_df["profit"] >= 0) & (_ins_df["margin_pct"].fillna(100) < 10)]
+# 2. Low margin clients (<10%, but profitable)
+if "client" in master.columns and "profit" in master.columns:
+    _by_client_m = master.groupby("client").agg(
+        billing=("billing", "sum"), profit=("profit", "sum")
+    )
+    _by_client_m["margin"] = (
+        _by_client_m["profit"] / _by_client_m["billing"].replace(0, float("nan")) * 100
+    ).fillna(0)
+    _low = _by_client_m[(_by_client_m["profit"] >= 0) & (_by_client_m["margin"] < 10)]
     if not _low.empty:
-        _alerts.append(("warning", f"⚠️ מרג'ין נמוך (<10%): {', '.join(_low['client'].tolist())}"))
+        _alerts.append(("warning", f"⚠️ מרג'ין נמוך (<10%): {', '.join(_low.index.tolist())}"))
 
-# 3. MoM billing drop (last 2 months in trend)
-if len(_trend_df) >= 2 and "billing_amount" in _trend_df.columns:
-    _t_last   = float(_trend_df.iloc[-1]["billing_amount"])
-    _t_prev   = float(_trend_df.iloc[-2]["billing_amount"])
+# 3. MoM billing drop >15%
+if len(_trend_df) >= 2 and "billing" in _trend_df.columns:
+    _t_last = float(_trend_df.iloc[-1]["billing"])
+    _t_prev = float(_trend_df.iloc[-2]["billing"])
     if _t_prev > 0:
-        _drop_pct = (_t_last - _t_prev) / _t_prev * 100
-        if _drop_pct < -15:
+        _drop = (_t_last - _t_prev) / _t_prev * 100
+        if _drop < -15:
             _alerts.append(("warning",
-                f"⚠️ ירידה בחיוב vs חודש קודם: {_drop_pct:.1f}% "
-                f"(₪{_t_prev:,.0f} → ₪{_t_last:,.0f})"))
+                f"⚠️ ירידה בחיוב: {_drop:.1f}% (₪{_t_prev:,.0f} → ₪{_t_last:,.0f})"))
 
-# 4. Issues from last run
+# 4. Issues from last calculation run
 _issues_last = st.session_state.get("last_issues", pd.DataFrame())
-if isinstance(_issues_last, pd.DataFrame) and not _issues_last.empty:
-    _n_issues = len(_issues_last)
-    _na = len(_issues_last[_issues_last.get("issue_type", pd.Series(dtype=str)).str.contains("הסכם חסר", na=False)]) if "issue_type" in _issues_last.columns else 0
+if isinstance(_issues_last, pd.DataFrame) and not _issues_last.empty and "issue_type" in _issues_last.columns:
+    _na = _issues_last["issue_type"].str.contains("הסכם חסר", na=False).sum()
     if _na:
         _alerts.append(("warning", f"⚠️ הסכם חסר — {_na} שורות בחישוב האחרון"))
+
+# 5. Validation warnings from master
+_val_warnings = validate_master(master)
+for _w in _val_warnings:
+    _alerts.append(("warning", f"⚠️ {_w}"))
 
 if _alerts:
     for kind, msg in _alerts:
@@ -737,18 +745,35 @@ if _alerts:
 else:
     st.success("✅ אין חריגות בנתונים המסוננים")
 
-# Recommendations expander
-if not _ins_df.empty:
-    with st.expander("💬 המלצות לפי לקוח"):
-        _rec = _ins_df.rename(columns={
-            "client": "לקוח", "billing_amount": "חיוב ₪", "profit": "רווח ₪",
-            "margin_pct": "% מרג'ין", "category": "קטגוריה", "insight": "המלצה",
+# Recommendations
+with st.expander("💬 המלצות לפי לקוח"):
+    if "client" in master.columns and "billing" in master.columns:
+        _rec_tbl = master.groupby("client", as_index=False).agg(
+            billing=("billing", "sum"), cost=("cost", "sum"), profit=("profit", "sum")
+        )
+        _rec_tbl["margin"] = (
+            _rec_tbl["profit"] / _rec_tbl["billing"].replace(0, float("nan")) * 100
+        ).round(1).fillna(0.0)
+        def _make_insight(row) -> str:
+            tips = []
+            if row["profit"] < 0:     tips.append("⚠️ לקוח מפסיד — בדיקה דחופה")
+            if 0 <= row["profit"] and row["margin"] < 10: tips.append("שקול העלאת תעריף")
+            if row["cost"] > 0 and row["billing"] > 0 and row["cost"] / row["billing"] > 0.85:
+                tips.append("בדוק עלויות עובדים")
+            return " | ".join(tips) if tips else "✓ מצב תקין"
+        _rec_tbl["category"] = _rec_tbl["margin"].apply(
+            lambda m: "HIGH" if m > 30 else "MEDIUM" if m >= 10 else "LOW" if m >= 0 else "LOSS"
+        )
+        _rec_tbl["insight"] = _rec_tbl.apply(_make_insight, axis=1)
+        _rec_tbl = _rec_tbl.sort_values("profit").rename(columns={
+            "client": "לקוח", "billing": "חיוב ₪", "profit": "רווח ₪",
+            "margin": "% מרג'ין", "category": "קטגוריה", "insight": "המלצה",
         })
-        _show = [c for c in ["לקוח", "חיוב ₪", "רווח ₪", "% מרג'ין", "קטגוריה", "המלצה"] if c in _rec.columns]
+        _rs = [c for c in ["לקוח", "חיוב ₪", "רווח ₪", "% מרג'ין", "קטגוריה", "המלצה"] if c in _rec_tbl.columns]
         st.dataframe(
-            _rec[_show].style
+            _rec_tbl[_rs].style
             .format({"חיוב ₪": "₪{:,.0f}", "רווח ₪": "₪{:,.0f}", "% מרג'ין": "{:.1f}%"})
-            .applymap(_scat, subset=["קטגוריה"] if "קטגוריה" in _rec.columns else []),
+            .applymap(_scat, subset=["קטגוריה"]),
             use_container_width=True, hide_index=True,
         )
 

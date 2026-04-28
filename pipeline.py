@@ -44,21 +44,22 @@ _OVERRIDES_CANDIDATES = [
 
 _MONTH_FOLDER_RE = _re.compile(r"^\d{2}-\d{4}$")
 
-# Power BI export column mapping: internal → export name
-_EXPORT_COLS = {
-    "month":          "month",
-    "client":         "client",
-    "site":           "site",
-    "employee_id":    "employee_id",
-    "employee_name":  "employee_name",
-    "days":           "days",
+# Internal detail_df column → canonical master column name
+_RENAME_MAP = {
     "total_hours":    "hours",
     "billing_amount": "billing",
-    "cost":           "cost",
-    "profit":         "profit",
     "margin_pct":     "margin",
-    "completion_added": "completion",
 }
+
+# Canonical master schema — exact order for Power BI
+_MASTER_SCHEMA = [
+    "month", "date", "year",
+    "client", "site",
+    "employee_id", "employee_name",
+    "days", "hours",
+    "billing", "cost", "profit", "margin",
+    "profit_per_hour", "cost_per_hour", "revenue_per_hour",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -610,52 +611,105 @@ def run_month_pipeline(month: str, data_root: str = DATA_ROOT) -> PipelineResult
 
 
 # ---------------------------------------------------------------------------
-# Master dataset
+# Master dataset — cleaning, export, summaries, validation
 # ---------------------------------------------------------------------------
 
-def _ensure_financials(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure profit and margin_pct columns are present and correct."""
-    if "profit" not in df.columns:
-        if "billing_amount" in df.columns and "cost" in df.columns:
-            df["profit"] = df["billing_amount"] - df["cost"]
-        else:
-            df["profit"] = 0.0
-    if "margin_pct" not in df.columns:
-        if "billing_amount" in df.columns:
-            df["margin_pct"] = (
-                df["profit"] / df["billing_amount"].replace(0, float("nan")) * 100
-            ).round(1).fillna(0.0)
-        else:
-            df["margin_pct"] = 0.0
+def _clean_master(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transform raw detail_df rows into the canonical master schema:
+      1. Rename internal columns to clean English names
+      2. Derive profit + margin (always recalculated)
+      3. Add date (first day of month as datetime) and year
+      4. Add per-hour metrics (safe division)
+      5. Remove null/empty clients
+      6. Fill numeric nulls with 0; string nulls with ""
+      7. Drop duplicates on (month, employee_id, site)
+      8. Reorder to _MASTER_SCHEMA
+    """
+    df = df.copy()
+
+    # 1. Rename internal names → clean names
+    df = df.rename(columns={k: v for k, v in _RENAME_MAP.items() if k in df.columns})
+
+    # Ensure core columns exist
+    for col in ("billing", "cost"):
+        if col not in df.columns:
+            df[col] = 0.0
+
+    # 2. Always recalculate profit + margin from billing/cost
+    df["profit"] = (
+        pd.to_numeric(df["billing"], errors="coerce").fillna(0) -
+        pd.to_numeric(df["cost"],    errors="coerce").fillna(0)
+    ).round(2)
+    _b = pd.to_numeric(df["billing"], errors="coerce").replace(0, float("nan"))
+    df["margin"] = (df["profit"] / _b * 100).round(2).fillna(0.0)
+
+    # 3. Date + year from month (MM-YYYY)
+    if "month" in df.columns:
+        df["date"] = pd.to_datetime(df["month"], format="%m-%Y", errors="coerce")
+        df["year"] = df["date"].dt.year.astype("Int64")
+    else:
+        df["date"] = pd.NaT
+        df["year"] = pd.NA
+
+    # 4. Per-hour metrics (safe division)
+    _h = pd.to_numeric(df.get("hours", 0), errors="coerce").replace(0, float("nan"))
+    df["profit_per_hour"]  = (df["profit"]  / _h).round(2).fillna(0.0)
+    df["cost_per_hour"]    = (df["cost"]    / _h).round(2).fillna(0.0)
+    df["revenue_per_hour"] = (df["billing"] / _h).round(2).fillna(0.0)
+
+    # 5. Remove null/empty clients
+    if "client" in df.columns:
+        df = df[df["client"].notna() & (df["client"].astype(str).str.strip() != "")]
+
+    # 6. Fill nulls
+    num_cols = ["days", "hours", "billing", "cost", "profit", "margin",
+                "profit_per_hour", "cost_per_hour", "revenue_per_hour"]
+    for col in num_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    for col in ("client", "site", "employee_id", "employee_name"):
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+
+    # 7. Drop duplicates (keep last — most recently computed wins)
+    key_cols = [c for c in ("month", "employee_id", "site") if c in df.columns]
+    if key_cols:
+        df = df.drop_duplicates(subset=key_cols, keep="last")
+
+    # 8. Reorder: canonical schema first, extra columns at end
+    ordered = [c for c in _MASTER_SCHEMA if c in df.columns]
+    extra   = [c for c in df.columns if c not in _MASTER_SCHEMA]
+    df = df[ordered + extra].reset_index(drop=True)
+
     return df
 
 
 def _save_master_xlsx(master: pd.DataFrame) -> None:
-    """Save master dataset as Excel with clean English column names for Power BI."""
-    avail  = {k: v for k, v in _EXPORT_COLS.items() if k in master.columns}
-    export = master[list(avail.keys())].rename(columns=avail).copy()
+    """Save master_full.xlsx — flat table with clean schema for Power BI."""
+    # Only canonical columns in the export
+    export_cols = [c for c in _MASTER_SCHEMA if c in master.columns]
+    export = master[export_cols].copy()
 
-    # Ensure no nulls in critical fields
-    for col in ("client", "site", "employee_id", "employee_name"):
-        if col in export.columns:
-            export[col] = export[col].fillna("").astype(str)
-    for col in ("hours", "billing", "cost", "profit", "margin", "days", "completion"):
-        if col in export.columns:
-            export[col] = pd.to_numeric(export[col], errors="coerce").fillna(0.0).round(2)
+    # Format date as string (Excel-friendly)
+    if "date" in export.columns:
+        export["date"] = pd.to_datetime(export["date"]).dt.strftime("%Y-%m-%d")
 
-    export.sort_values(["month", "client", "employee_name"], inplace=True, ignore_index=True)
+    sort_cols = [c for c in ("month", "client", "employee_name") if c in export.columns]
+    if sort_cols:
+        export.sort_values(sort_cols, inplace=True, ignore_index=True)
+
     export.to_excel(MASTER_XLSX, index=False, sheet_name="master_full")
 
 
 def build_master_full(data_root: str = DATA_ROOT) -> tuple[pd.DataFrame, list[str]]:
     """
-    Scan all available month folders, compute billing for each, merge,
-    and save to:
-      data/master_full.parquet  — internal analytics
-      data/master_full.xlsx     — Power BI export
+    Scan all month folders, compute billing for each, clean, merge, and save:
+      data/master_full.parquet  — canonical internal dataset
+      data/master_full.xlsx     — Power BI flat export
 
-    Returns (master_df, error_list).
-    Missing-file errors are non-fatal and collected.
+    Returns (master_df, error_list). Missing-file errors are non-fatal.
     """
     months = list_available_months(data_root)
     if not months:
@@ -672,7 +726,6 @@ def build_master_full(data_root: str = DATA_ROOT) -> tuple[pd.DataFrame, list[st
                 errors.append(f"{month}: ריק לאחר חישוב")
                 continue
             df["month"] = month
-            df = _ensure_financials(df)
             all_slices.append(df)
         except FileNotFoundError as e:
             errors.append(f"{month}: {e}")
@@ -682,41 +735,144 @@ def build_master_full(data_root: str = DATA_ROOT) -> tuple[pd.DataFrame, list[st
     if not all_slices:
         return pd.DataFrame(), errors
 
-    master = pd.concat(all_slices, ignore_index=True)
-    master = _ensure_financials(master)
+    master = _clean_master(pd.concat(all_slices, ignore_index=True))
 
-    os.makedirs(os.path.dirname(os.path.abspath(MASTER_PATH)) or ".", exist_ok=True)
+    # Validate
+    warnings = validate_master(master)
+    errors.extend(warnings)
+
+    _dir = os.path.dirname(os.path.abspath(MASTER_PATH)) or "."
+    os.makedirs(_dir, exist_ok=True)
     master.to_parquet(MASTER_PATH, index=False)
     try:
         _save_master_xlsx(master)
     except Exception as e:
         errors.append(f"xlsx export error: {e}")
 
+    # Save summary tables
+    try:
+        _save_summary_tables(master)
+    except Exception as e:
+        errors.append(f"summary tables error: {e}")
+
     return master, errors
 
 
 def update_master(detail_df: pd.DataFrame, month: str) -> None:
-    """Upsert a single month's rows into master_full.parquet and master_full.xlsx."""
+    """Upsert a single month into master_full.parquet + .xlsx + summaries."""
     slim = detail_df.copy()
     slim["month"] = month
-    slim = _ensure_financials(slim)
 
     if os.path.exists(MASTER_PATH):
         try:
             existing = pd.read_parquet(MASTER_PATH)
             existing = existing[existing["month"] != month]
-            master   = pd.concat([existing, slim], ignore_index=True)
+            combined = pd.concat([existing, slim], ignore_index=True)
         except Exception:
-            master = slim
+            combined = slim
     else:
-        master = slim
+        combined = slim
 
-    os.makedirs(os.path.dirname(os.path.abspath(MASTER_PATH)) or ".", exist_ok=True)
+    master = _clean_master(combined)
+    _dir = os.path.dirname(os.path.abspath(MASTER_PATH)) or "."
+    os.makedirs(_dir, exist_ok=True)
     master.to_parquet(MASTER_PATH, index=False)
     try:
         _save_master_xlsx(master)
     except Exception:
         pass
+    try:
+        _save_summary_tables(master)
+    except Exception:
+        pass
+
+
+def validate_master(master: pd.DataFrame) -> list[str]:
+    """
+    Validate master dataset. Returns list of warning strings (non-fatal).
+    """
+    warnings: list[str] = []
+
+    required = ["month", "client", "billing", "cost", "profit"]
+    missing  = [c for c in required if c not in master.columns]
+    if missing:
+        warnings.append(f"עמודות חסרות: {', '.join(missing)}")
+        return warnings  # can't do further checks
+
+    null_clients = master["client"].isna() | (master["client"].astype(str).str.strip() == "")
+    if null_clients.any():
+        warnings.append(f"{null_clients.sum()} שורות ללא לקוח הוסרו מ-Master")
+
+    # Cost > 2× billing is usually a data error
+    suspicious = master[(master["billing"] > 0) & (master["cost"] > master["billing"] * 2)]
+    if not suspicious.empty:
+        warnings.append(
+            f"{len(suspicious)} שורות עם עלות > 2× חיוב — בדוק נתונים"
+        )
+
+    # Warn if no month has any billing
+    zero_billing = master[master["billing"] == 0]
+    if len(zero_billing) == len(master):
+        warnings.append("כל שורות המאסטר עם חיוב 0 — בדוק הסכמים")
+
+    return warnings
+
+
+def build_summary_tables(master: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """
+    Build three summary tables from master data:
+      monthly_summary  — by month
+      client_summary   — by client
+      employee_summary — by employee
+    """
+    if master.empty:
+        return {}
+
+    tables: dict[str, pd.DataFrame] = {}
+
+    def _margin(profit_col: pd.Series, billing_col: pd.Series) -> pd.Series:
+        return (profit_col / billing_col.replace(0, float("nan")) * 100).round(2).fillna(0.0)
+
+    if "month" in master.columns:
+        m = master.groupby("month", as_index=False).agg(
+            total_revenue=("billing", "sum"),
+            total_cost   =("cost",    "sum"),
+            total_profit =("profit",  "sum"),
+            total_hours  =("hours",   "sum"),
+        ).sort_values("month")
+        m["margin"] = _margin(m["total_profit"], m["total_revenue"])
+        tables["monthly_summary"] = m
+
+    if "client" in master.columns:
+        c = master.groupby("client", as_index=False).agg(
+            total_revenue=("billing", "sum"),
+            total_cost   =("cost",    "sum"),
+            total_profit =("profit",  "sum"),
+            total_hours  =("hours",   "sum"),
+        ).sort_values("total_revenue", ascending=False)
+        c["margin"] = _margin(c["total_profit"], c["total_revenue"])
+        tables["client_summary"] = c
+
+    if "employee_name" in master.columns:
+        e = master.groupby("employee_name", as_index=False).agg(
+            total_cost   =("cost",    "sum"),
+            total_hours  =("hours",   "sum"),
+            total_billing=("billing", "sum"),
+        ).sort_values("total_cost", ascending=False)
+        tables["employee_summary"] = e
+
+    return tables
+
+
+def _save_summary_tables(master: pd.DataFrame) -> None:
+    """Write monthly/client/employee summaries as sheets in data/summaries.xlsx."""
+    tables = build_summary_tables(master)
+    if not tables:
+        return
+    summaries_path = os.path.join(DATA_ROOT, "summaries.xlsx")
+    with pd.ExcelWriter(summaries_path, engine="openpyxl") as writer:
+        for sheet, df in tables.items():
+            df.to_excel(writer, sheet_name=sheet, index=False)
 
 
 def get_all_data() -> pd.DataFrame:
@@ -748,34 +904,45 @@ def filter_by_client(df: pd.DataFrame, clients) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Analytics helpers (operate on master_full data)
+# Analytics helpers — operate on clean master_full data
+# (column names: billing, cost, profit, hours, margin)
 # ---------------------------------------------------------------------------
 
 def get_profit_trend(df: pd.DataFrame) -> pd.DataFrame:
-    """Monthly totals: month | billing_amount | profit | cost | total_hours."""
+    """Monthly totals: month | billing | profit | cost | hours."""
     if df.empty or "month" not in df.columns:
         return pd.DataFrame()
-    agg_cols = {c: "sum" for c in ("billing_amount", "profit", "cost", "total_hours") if c in df.columns}
+    agg_cols = {c: "sum" for c in ("billing", "profit", "cost", "hours") if c in df.columns}
     if not agg_cols:
         return pd.DataFrame()
-    return df.groupby("month", as_index=False).agg(agg_cols).sort_values("month")
+    trend = df.groupby("month", as_index=False).agg(agg_cols).sort_values("month")
+    if "profit" in trend.columns and "billing" in trend.columns:
+        trend["margin"] = (
+            trend["profit"] / trend["billing"].replace(0, float("nan")) * 100
+        ).round(1).fillna(0.0)
+    return trend
 
 
 def get_top_clients(df: pd.DataFrame, n: int = 8) -> pd.DataFrame:
-    if df.empty or "client" not in df.columns or "billing_amount" not in df.columns:
+    if df.empty or "client" not in df.columns or "billing" not in df.columns:
         return pd.DataFrame()
-    return (
+    grp = (
         df.groupby("client", as_index=False)
-        .agg(billing_amount=("billing_amount", "sum"), profit=("profit", "sum"))
-        .nlargest(n, "billing_amount")
+        .agg(billing=("billing", "sum"), profit=("profit", "sum"),
+             cost=("cost", "sum"), hours=("hours", "sum"))
+        .nlargest(n, "billing")
         .reset_index(drop=True)
     )
+    grp["margin"] = (
+        grp["profit"] / grp["billing"].replace(0, float("nan")) * 100
+    ).round(1).fillna(0.0)
+    return grp
 
 
 def get_top_employees(df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
     if df.empty or "employee_name" not in df.columns:
         return pd.DataFrame()
-    agg_cols = {c: (c, "sum") for c in ("cost", "total_hours", "profit") if c in df.columns}
+    agg_cols = {c: (c, "sum") for c in ("cost", "hours", "profit") if c in df.columns}
     if not agg_cols:
         return pd.DataFrame()
     return (
