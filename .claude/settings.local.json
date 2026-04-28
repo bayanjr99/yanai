@@ -18,7 +18,14 @@
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501)",
       "Bash([ -f \"$SRC\" ])",
       "Bash([ ! -f \"$DEST\" ])",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('app.py OK'\\)\")",
+      "Bash(xargs rm *)",
+      "Bash(python -c \"import pipeline; print\\('pipeline OK'\\)\")",
+      "Bash(python -c \"import app\")",
+      "Bash(python -m py_compile app.py pipeline.py)",
+      "Bash(grep -E \"^[0-9]{2}-[0-9]{4}$\")",
+      "Bash(python -m py_compile pipeline.py app.py)",
+      "Bash(git add *)"
     ]
   }
 }

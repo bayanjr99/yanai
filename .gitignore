@@ -19,12 +19,16 @@ env/
 *.db
 *.sqlite3
 
-# Output / sessions (runtime data, not source)
+# Runtime-generated directories and files
 output/
 sessions/
 uploads/
 build/
 history/
+
+# Generated master dataset
+data/master_full.parquet
+data/master.parquet
 
 # Data files — real payroll PDFs and Excel sheets (private business data)
 data/**/*.pdf
