@@ -21,7 +21,8 @@ from pipeline import (
     run_month_pipeline, build_master_full, list_available_months,
     month_file_mtime, update_master, get_all_data, filter_by_client,
     get_profit_trend, get_top_clients, get_top_employees, build_summary_tables,
-    validate_master, DATA_ROOT, MASTER_PATH, MASTER_XLSX,
+    validate_master, DATA_ROOT, OUTPUT_ROOT, MASTER_DIR,
+    MASTER_PATH, MASTER_XLSX,
 )
 from core.validation import ValidationError
 

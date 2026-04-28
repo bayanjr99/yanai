@@ -386,7 +386,33 @@ def detect_warnings(
                 f"(threshold ₪{cost_per_hour_threshold:.0f}/h)",
             )
 
-        # 4. Allocation validation: sum(allocated_cost) per employee must equal employer_cost
+        # 4. No negative values in allocated_cost or cost_per_hour
+        neg = merged[
+            (merged["allocated_cost"] < 0) | (merged["cost_per_hour"] < 0)
+        ]
+        for _, r in neg.drop_duplicates("employee_id").iterrows():
+            _warn(
+                str(r["employee_id"]),
+                f"Negative value: allocated_cost={r['allocated_cost']:.2f}, "
+                f"cost_per_hour={r['cost_per_hour']:.2f}",
+            )
+
+        # 5. Sum of site hours per employee must equal emp_total_hours
+        hours_check = (
+            merged.groupby("employee_id", as_index=True)
+            .agg(sum_site=("total_hours", "sum"), emp_total=("emp_total_hours", "first"))
+        )
+        bad_hours = hours_check[
+            (hours_check["sum_site"] - hours_check["emp_total"]).abs() > 0.01
+        ]
+        for eid, r in bad_hours.iterrows():
+            _warn(
+                str(eid),
+                f"Hours mismatch: sum(site_hours)={r['sum_site']:.2f} "
+                f"≠ emp_total_hours={r['emp_total']:.2f}",
+            )
+
+        # 6. Allocation validation: sum(allocated_cost) per employee must equal employer_cost
         alloc_check = (
             merged.groupby("employee_id", as_index=False)
             .agg(sum_allocated=("allocated_cost", "sum"),

@@ -30,10 +30,12 @@ from core.billing_engine import calculate
 # Config
 # ---------------------------------------------------------------------------
 
-DATA_ROOT     = os.getenv("DATA_ROOT", "data")
-MASTER_PATH   = os.path.join(DATA_ROOT, "master_full.parquet")
-MASTER_XLSX   = os.path.join(DATA_ROOT, "master_full.xlsx")
-CALENDAR_XLSX = os.path.join(DATA_ROOT, "calendar.xlsx")
+DATA_ROOT     = os.getenv("DATA_ROOT",   "data")
+OUTPUT_ROOT   = os.getenv("OUTPUT_ROOT", "output")
+MASTER_DIR    = os.path.join(OUTPUT_ROOT, "master")
+MASTER_PATH   = os.path.join(MASTER_DIR, "master_full.parquet")
+MASTER_XLSX   = os.path.join(MASTER_DIR, "master_full.xlsx")
+CALENDAR_XLSX = os.path.join(MASTER_DIR, "calendar.xlsx")
 
 _AGREEMENTS_CANDIDATES = [
     os.path.join(DATA_ROOT, "agreements.xlsx"),
@@ -813,8 +815,7 @@ def build_master_full(data_root: str = DATA_ROOT) -> tuple[pd.DataFrame, list[st
     warnings = validate_master(master)
     errors.extend(warnings)
 
-    _dir = os.path.dirname(os.path.abspath(MASTER_PATH)) or "."
-    os.makedirs(_dir, exist_ok=True)
+    os.makedirs(MASTER_DIR, exist_ok=True)
     master.to_parquet(MASTER_PATH, index=False)
     try:
         _save_master_xlsx(master)
@@ -852,8 +853,7 @@ def update_master(detail_df: pd.DataFrame, month: str) -> None:
         combined = slim
 
     master = _clean_master(combined)
-    _dir = os.path.dirname(os.path.abspath(MASTER_PATH)) or "."
-    os.makedirs(_dir, exist_ok=True)
+    os.makedirs(MASTER_DIR, exist_ok=True)
     master.to_parquet(MASTER_PATH, index=False)
     try:
         _save_master_xlsx(master)
@@ -970,11 +970,12 @@ def build_summary_tables(master: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
 
 def _save_summary_tables(master: pd.DataFrame) -> None:
-    """Write monthly/client/employee summaries as sheets in data/summaries.xlsx."""
+    """Write monthly/client/employee summaries as sheets in output/master/summaries.xlsx."""
     tables = build_summary_tables(master)
     if not tables:
         return
-    summaries_path = os.path.join(DATA_ROOT, "summaries.xlsx")
+    os.makedirs(MASTER_DIR, exist_ok=True)
+    summaries_path = os.path.join(MASTER_DIR, "summaries.xlsx")
     with pd.ExcelWriter(summaries_path, engine="openpyxl") as writer:
         for sheet, df in tables.items():
             df.to_excel(writer, sheet_name=sheet, index=False)

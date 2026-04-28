@@ -23,7 +23,8 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from pipeline import (
-    DATA_ROOT, MASTER_PATH, MASTER_XLSX, CALENDAR_XLSX,
+    DATA_ROOT, OUTPUT_ROOT, MASTER_DIR,
+    MASTER_PATH, MASTER_XLSX, CALENDAR_XLSX,
     list_available_months,
     build_master_full,
     build_summary_tables,
@@ -117,7 +118,7 @@ def run(data_root: str = DATA_ROOT, onedrive_path: str | None = None) -> int:
     _log(f"Saved: {os.path.abspath(MASTER_PATH)}")
     _log(f"Saved: {os.path.abspath(MASTER_XLSX)}")
 
-    summaries_path = os.path.join(data_root, "summaries.xlsx")
+    summaries_path = os.path.join(MASTER_DIR, "summaries.xlsx")
     if os.path.exists(summaries_path):
         _log(f"Saved: {os.path.abspath(summaries_path)}")
 
@@ -131,7 +132,7 @@ def run(data_root: str = DATA_ROOT, onedrive_path: str | None = None) -> int:
         _log(f"Copying to OneDrive: {onedrive_path}")
         try:
             os.makedirs(onedrive_path, exist_ok=True)
-            for src in (MASTER_XLSX, summaries_path):
+            for src in (MASTER_XLSX, CALENDAR_XLSX, summaries_path):
                 if os.path.exists(src):
                     dest = os.path.join(onedrive_path, os.path.basename(src))
                     shutil.copy2(src, dest)

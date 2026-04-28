@@ -2,12 +2,17 @@
 run_cost_analysis.py — CLI runner for employee cost analysis.
 
 Usage:
-    python run_cost_analysis.py                        # uses data/02-2026/
-    python run_cost_analysis.py --month 02-2025        # specific month
+    python run_cost_analysis.py                     # latest available month
+    python run_cost_analysis.py --month 02-2025     # specific month
     python run_cost_analysis.py --month 02-2025 --threshold 250
-    python run_cost_analysis.py --all                  # all available months
+    python run_cost_analysis.py --all               # all available months
 
-Output: data/cost_analysis.xlsx  (or  data/<month>/cost_analysis.xlsx for --all)
+Output:
+    output/monthly/MM-YYYY/cost_analysis.xlsx
+
+Reads from:
+    data/MM-YYYY/hours.pdf
+    data/MM-YYYY/costs.xlsx
 """
 
 from __future__ import annotations
@@ -21,8 +26,9 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from core.cost_analysis import run_month, load_hours_from_pdf, load_costs_xlsx
+from pipeline import DATA_ROOT, OUTPUT_ROOT
 
-DATA_ROOT = os.getenv("DATA_ROOT", "data")
+MONTHLY_OUT = os.path.join(OUTPUT_ROOT, "monthly")
 W = 64
 
 
@@ -184,7 +190,9 @@ def run_single(month: str, threshold: float) -> bool:
         print(f"  ERROR: hours.pdf or costs.xlsx not found for month {month}")
         return False
 
-    output_path = os.path.join(DATA_ROOT, "cost_analysis.xlsx")
+    month_out_dir = os.path.join(MONTHLY_OUT, month)
+    os.makedirs(month_out_dir, exist_ok=True)
+    output_path = os.path.join(month_out_dir, "cost_analysis.xlsx")
 
     _rule()
     print(f"  COST ANALYSIS — {month}")
@@ -254,7 +262,7 @@ def run_all(threshold: float) -> None:
     all_ok, all_fail = [], []
     for month in months:
         pdf_path, costs_path = _find_month_folder(month)
-        output_path = os.path.join(DATA_ROOT, month, "cost_analysis.xlsx")
+        output_path = os.path.join(MONTHLY_OUT, month, "cost_analysis.xlsx")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         try:
             summary = run_month(pdf_path, costs_path, month, output_path, threshold)
