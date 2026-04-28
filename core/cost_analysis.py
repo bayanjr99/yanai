@@ -149,6 +149,22 @@ def load_costs_xlsx(path: str) -> pd.DataFrame:
 
     # Keep only rows with a valid numeric employee_id
     result = result[result["employee_id"].str.fullmatch(r"\d{3,6}")].copy()
+    result["employer_cost"] = pd.to_numeric(result["employer_cost"], errors="coerce").fillna(0.0)
+    result["gross_salary"]  = pd.to_numeric(result["gross_salary"],  errors="coerce").fillna(0.0)
+
+    # FIX: sum all cost rows for the same employee_id — never use keep="first"
+    # An employee may appear in multiple rows (different client/site assignments)
+    # but their total employer cost is the SUM of all those rows.
+    result = (
+        result
+        .groupby("employee_id", as_index=False)
+        .agg(
+            employer_cost=("employer_cost", "sum"),
+            gross_salary =("gross_salary",  "sum"),
+            client       =("client",        "first"),  # administrative reference only
+            site         =("site",          "first"),
+        )
+    )
     result["employer_cost"] = result["employer_cost"].round(2)
     result["gross_salary"]  = result["gross_salary"].round(2)
 
@@ -190,26 +206,27 @@ def merge_and_allocate(
         .rename(columns={"total_hours": "emp_total_hours"})
     )
 
-    # One employer_cost per employee (take first if duplicates exist in costs file)
-    c_dedup = c.drop_duplicates(subset="employee_id", keep="first")[
-        ["employee_id", "employer_cost", "client", "gross_salary"]
-    ]
-
-    # Join
+    # costs_df is already deduplicated + summed by load_costs_xlsx()
+    # Left join: employees in hours but NOT in costs get employer_cost = 0
+    # Employees in costs but NOT in hours are excluded (left join on hours)
     merged = (
         h
         .merge(emp_totals, on="employee_id", how="left")
-        .merge(c_dedup,    on="employee_id", how="left")
+        .merge(
+            c[["employee_id", "employer_cost", "client"]],
+            on="employee_id",
+            how="left",          # keeps all hour rows; missing cost → NaN → 0
+        )
     )
+    merged["employer_cost"] = merged["employer_cost"].fillna(0.0)
 
-    # Cost allocation by hours ratio
+    # Allocate employer_cost across sites by hours ratio
     _safe_total = merged["emp_total_hours"].replace(0, float("nan"))
     merged["allocated_cost"] = (
-        merged["employer_cost"].fillna(0) *
-        merged["total_hours"] / _safe_total
+        merged["employer_cost"] * merged["total_hours"] / _safe_total
     ).round(2).fillna(0.0)
 
-    # Cost per hour (null-safe)
+    # Cost per hour at site level (safe: 0 when hours = 0)
     _safe_hours = merged["total_hours"].replace(0, float("nan"))
     merged["cost_per_hour"] = (
         merged["allocated_cost"] / _safe_hours
@@ -239,12 +256,14 @@ def build_sheets(merged: pd.DataFrame) -> dict[str, pd.DataFrame]:
         }
 
     # ── Sheet 1: employee_cost ────────────────────────────────────────────────
+    # employer_cost is already summed per employee_id in load_costs_xlsx()
     emp_cost = (
         merged
-        .groupby(["month", "employee_id", "employee_name"], as_index=False)
+        .groupby(["month", "employee_id"], as_index=False)
         .agg(
+            employee_name=("employee_name", "first"),   # from PDF — display only
             total_hours  =("total_hours",   "sum"),
-            employer_cost=("employer_cost", "first"),   # same value per employee
+            employer_cost=("employer_cost", "first"),   # identical across sites
         )
     )
     _safe = emp_cost["total_hours"].replace(0, float("nan"))
@@ -253,14 +272,20 @@ def build_sheets(merged: pd.DataFrame) -> dict[str, pd.DataFrame]:
     ).round(2).fillna(0.0)
     emp_cost["total_hours"]   = emp_cost["total_hours"].round(2)
     emp_cost["employer_cost"] = emp_cost["employer_cost"].round(2)
-    emp_cost = emp_cost.sort_values(["month", "employee_id"]).reset_index(drop=True)
+
+    # Enforce output column order
+    emp_cost = emp_cost[[
+        "month", "employee_id", "employee_name",
+        "total_hours", "employer_cost", "cost_per_hour",
+    ]].sort_values(["month", "employee_id"]).reset_index(drop=True)
 
     # ── Sheet 2: site_cost ────────────────────────────────────────────────────
-    site_cost = merged[[
-        "month", "client", "site", "employee_id", "employee_name",
-        "total_hours", "allocated_cost", "cost_per_hour",
-    ]].copy()
-    site_cost = site_cost.rename(columns={"total_hours": "hours"})
+    site_cost_cols = [c for c in
+        ["month", "client", "site", "employee_id", "total_hours",
+         "allocated_cost", "cost_per_hour"]
+        if c in merged.columns
+    ]
+    site_cost = merged[site_cost_cols].copy().rename(columns={"total_hours": "hours"})
     site_cost = site_cost.sort_values(
         ["month", "client", "site", "employee_id"]
     ).reset_index(drop=True)
@@ -270,6 +295,7 @@ def build_sheets(merged: pd.DataFrame) -> dict[str, pd.DataFrame]:
         client_cost = (
             merged
             .dropna(subset=["client"])
+            .query("client != ''")
             .groupby(["month", "client"], as_index=False)
             .agg(
                 total_hours=("total_hours",    "sum"),
@@ -282,9 +308,9 @@ def build_sheets(merged: pd.DataFrame) -> dict[str, pd.DataFrame]:
         ).round(2).fillna(0.0)
         client_cost["total_hours"] = client_cost["total_hours"].round(2)
         client_cost["total_cost"]  = client_cost["total_cost"].round(2)
-        client_cost = client_cost.sort_values(
-            ["month", "total_cost"], ascending=[True, False]
-        ).reset_index(drop=True)
+        client_cost = client_cost[
+            ["month", "client", "total_hours", "total_cost", "avg_cost_per_hour"]
+        ].sort_values(["month", "total_cost"], ascending=[True, False]).reset_index(drop=True)
     else:
         client_cost = pd.DataFrame(
             columns=["month", "client", "total_hours", "total_cost", "avg_cost_per_hour"]
@@ -306,76 +332,50 @@ def detect_warnings(
     costs_df: pd.DataFrame,
     merged: pd.DataFrame,
     month: str,
-    cost_per_hour_threshold: float = 200.0,
+    cost_per_hour_threshold: float = 250.0,
 ) -> pd.DataFrame:
     """
     Return a DataFrame of data quality issues.
 
     Checks:
-      1. Employees in hours PDF but missing from costs.xlsx
-      2. Employees in costs.xlsx but with zero hours this month
-      3. Duplicate employee_id in costs.xlsx
-      4. Zero hours with positive employer cost
-      5. cost_per_hour > threshold (default 200)
+      1. Employee in hours PDF but missing from costs.xlsx → cost set to 0
+      2. Employee has zero hours this month with positive cost → excluded, warned
+      3. cost_per_hour > threshold (default 250)
     """
     rows: list[dict] = []
 
-    def _warn(emp_id: str, emp_name: str, issue: str) -> None:
-        rows.append({
-            "month":         month,
-            "employee_id":   emp_id,
-            "employee_name": emp_name,
-            "issue":         issue,
-        })
+    def _warn(emp_id: str, issue: str) -> None:
+        rows.append({"month": month, "employee_id": emp_id, "issue": issue})
 
-    if hours_df.empty and costs_df.empty:
-        return pd.DataFrame(columns=["month", "employee_id", "employee_name", "issue"])
+    if hours_df.empty:
+        return pd.DataFrame(columns=["month", "employee_id", "issue"])
 
-    hours_ids = set(hours_df["employee_id"].astype(str).str.strip()) if not hours_df.empty else set()
+    hours_ids = set(hours_df["employee_id"].astype(str).str.strip())
     costs_ids = set(costs_df["employee_id"].astype(str).str.strip()) if not costs_df.empty else set()
 
-    # 1. In hours but not in costs
+    # 1. In hours but not in costs → kept with employer_cost = 0
     for eid in sorted(hours_ids - costs_ids):
-        name = ""
-        if not hours_df.empty:
-            rows_for = hours_df[hours_df["employee_id"] == eid]
-            name = rows_for["employee_name"].iloc[0] if not rows_for.empty else ""
-        _warn(eid, name, "In hours PDF — missing from costs.xlsx")
-
-    # 2. In costs but not in hours (has cost but didn't work this month)
-    for eid in sorted(costs_ids - hours_ids):
-        row_c = costs_df[costs_df["employee_id"] == eid]
-        cost  = float(row_c["employer_cost"].iloc[0]) if not row_c.empty else 0
-        if cost > 0:
-            _warn(eid, "", f"In costs.xlsx (₪{cost:,.0f}) — no hours in PDF this month")
-
-    # 3. Duplicate employee_id in costs.xlsx
-    if not costs_df.empty:
-        dups = costs_df[costs_df.duplicated(subset="employee_id", keep=False)]
-        for eid, grp in dups.groupby("employee_id"):
-            _warn(str(eid), "", f"Duplicate employee_id in costs.xlsx ({len(grp)} rows)")
+        _warn(eid, "Missing cost data — employer_cost set to 0")
 
     if not merged.empty:
-        # 4. Zero hours with positive allocated cost
-        zero_h = merged[(merged["total_hours"] == 0) & (merged["allocated_cost"] > 0)]
-        for _, r in zero_h.iterrows():
+        # 2. Zero hours with positive employer cost (edge case)
+        zero_h = merged[(merged["total_hours"] == 0) & (merged["employer_cost"] > 0)]
+        for _, r in zero_h.drop_duplicates("employee_id").iterrows():
             _warn(
                 str(r["employee_id"]),
-                str(r.get("employee_name", "")),
-                f"Zero hours at site '{r['site']}' but allocated cost ₪{r['allocated_cost']:,.0f}",
+                f"Zero hours but employer_cost ₪{r['employer_cost']:,.0f} — cost_per_hour set to 0",
             )
 
-        # 5. cost_per_hour above threshold
+        # 3. Unusually high cost_per_hour
         high_rate = merged[merged["cost_per_hour"] > cost_per_hour_threshold]
-        for _, r in high_rate.iterrows():
+        for _, r in high_rate.drop_duplicates("employee_id").iterrows():
             _warn(
                 str(r["employee_id"]),
-                str(r.get("employee_name", "")),
                 f"High cost_per_hour ₪{r['cost_per_hour']:.0f}/h "
-                f"at site '{r['site']}' (threshold ₪{cost_per_hour_threshold:.0f}/h)",
+                f"(threshold ₪{cost_per_hour_threshold:.0f}/h)",
             )
 
-    df = pd.DataFrame(rows, columns=["month", "employee_id", "employee_name", "issue"])
+    df = pd.DataFrame(rows, columns=["month", "employee_id", "issue"])
     return df.drop_duplicates().reset_index(drop=True)
 
 
@@ -410,7 +410,7 @@ def run_month(
     costs_path: str,
     month: str,
     output_path: str,
-    cost_per_hour_threshold: float = 200.0,
+    cost_per_hour_threshold: float = 250.0,
 ) -> dict:
     """
     Full pipeline for one month:

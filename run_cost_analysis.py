@@ -166,8 +166,12 @@ def _print_warnings(warnings_df) -> None:
     if warnings_df.empty:
         print("  ✓ No warnings")
         return
-    for _, r in warnings_df.iterrows():
+    # Show max 20 — full list goes into the Excel warnings sheet
+    shown = warnings_df.head(20)
+    for _, r in shown.iterrows():
         print(f"  ⚠  [{r['employee_id']}] {r['issue']}")
+    if len(warnings_df) > 20:
+        print(f"  ... and {len(warnings_df) - 20} more — see warnings sheet in Excel")
 
 
 # ---------------------------------------------------------------------------
