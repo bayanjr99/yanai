@@ -26,6 +26,20 @@ uploads/
 build/
 history/
 
+# Exceptions: pre-computed parquets the dashboard reads from on Streamlit Cloud.
+# These contain processed payroll data — only acceptable in a PRIVATE repo.
+!output/
+!output/cache/
+!output/cache/processed_data.parquet
+!output/cache/income.parquet
+!output/cache/standards.parquet
+!output/cache/standards_audit.parquet
+!output/cache/warnings.parquet
+!output/cache/build_meta.json
+!output/cache/_data_signatures.json
+!output/master/
+!output/master/master_full.parquet
+
 # Generated master dataset
 data/master_full.parquet
 data/master.parquet
