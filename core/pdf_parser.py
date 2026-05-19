@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Output column contract
 # ---------------------------------------------------------------------------
-DAILY_COLS = ["employee_id", "employee_name", "date", "site", "hours_to_pay", "break_hours"]
+DAILY_COLS = ["employee_id", "employee_name", "date", "site", "hours_to_pay", "break_hours", "break_source"]
 
 # ---------------------------------------------------------------------------
 # Compiled patterns
@@ -168,7 +168,15 @@ def _parse_daily_row(line: str, month: int, year: int) -> Optional[dict]:
     # Values ≥ 1.0 at the start mean no break was recorded and the first
     # decimal is already the 100% work hours column.
     first_val   = _to_float(hour_matches[0].group())
-    break_hours = first_val if first_val < 1.0 else 0.0
+    # TODO: this heuristic fails when an employee works < 1h on a day (first_val
+    # would be misclassified as a break). A column-position approach (pdfplumber)
+    # would be more reliable. break_source marks these rows for future review.
+    if first_val < 1.0 and len(hour_matches) > 1:
+        break_hours  = first_val
+        break_source = "heuristic"
+    else:
+        break_hours  = 0.0
+        break_source = "none"
 
     # Site = everything after the last N.NN value
     site_raw = line[last_match.end():].strip()
@@ -190,6 +198,7 @@ def _parse_daily_row(line: str, month: int, year: int) -> Optional[dict]:
         "site":         site,
         "hours_to_pay": hours_to_pay,
         "break_hours":  break_hours,
+        "break_source": break_source,
         "start_time":   time_m.group(1),
         "end_time":     time_m.group(2),
     }
@@ -245,6 +254,7 @@ def _parse_page(text: str) -> tuple[list[dict], Optional[float]]:
             "site":          site,
             "hours_to_pay":  parsed["hours_to_pay"],
             "break_hours":   parsed["break_hours"],
+            "break_source":  parsed.get("break_source", "none"),
         })
 
     return rows, page_total

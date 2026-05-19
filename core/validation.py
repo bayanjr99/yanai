@@ -132,7 +132,9 @@ def validate_pdf(pdf_path: str, tolerance: float = 0.05) -> list[ValidationResul
             note   = ""
         else:
             has_excluded = bool(_EXCLUDED_RE.search(text))
-            if has_excluded:
+            # EXPECTED only when excluded days explain a shortfall (parsed < pdf_total).
+            # If parsed > pdf_total, excluded days cannot explain the surplus — that's a bug.
+            if has_excluded and parsed < pdf_total:
                 status = "EXPECTED"
                 note   = f"הפרש {diff:.2f}h מוסבר ע\"י ימים מוחרגים (לא לדיווח / חופשה)"
             else:

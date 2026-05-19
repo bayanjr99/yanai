@@ -322,7 +322,13 @@ def top_insights(df: pd.DataFrame, month: str | None = None, n: int = 5) -> dict
     - profitable: highest profit
     - loss:       loss-making clients (profit < 0) sorted worst first
     - growth:     highest MoM billing growth % (requires month + prev month)
+
+    Internal entities (e.g. ינאי פרסונל — our own company) are excluded from
+    the loss list because they carry overhead cost without external billing
+    by design, not as a leak. See ``core.internal_entities``.
     """
+    from core.internal_entities import is_internal
+
     sub = df[df["month"] == month].copy() if month else df.copy()
 
     empty = pd.DataFrame(
@@ -345,7 +351,9 @@ def top_insights(df: pd.DataFrame, month: str | None = None, n: int = 5) -> dict
         ["client", "billing_amount", "profit", "margin_pct"]
     ].reset_index(drop=True)
 
-    loss_rows = grp[grp["profit"] < 0]
+    # Exclude internal entities (overhead, not a "loss-making client")
+    loss_rows = grp[(grp["profit"] < 0) &
+                    (~grp["client"].astype(str).map(is_internal))]
     loss = (
         loss_rows.nsmallest(n, "profit")[
             ["client", "billing_amount", "profit", "margin_pct"]

@@ -45,6 +45,15 @@ data/overrides.xlsx
 tmp*.json
 *.log
 *.tmp
+*.bak
+*.bak_*
+
+# Claude Code local state (worktrees, settings)
+.claude/worktrees/
+.claude/settings.local.json
+
+# Logs directory
+logs/
 
 # OS
 .DS_Store

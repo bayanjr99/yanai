@@ -71,6 +71,11 @@ def _hourly(
     days: float, total_hours: float, rate: float,
     monthly_min: float, daily_min: float,
 ) -> BillingResult:
+    # NOTE on daily_min semantics: this engine receives pre-aggregated monthly
+    # totals (not daily rows), so daily_min is applied as a monthly floor:
+    #   expected = days × daily_min.
+    # In contrast, rules_engine.py applies daily_min PER DAY to individual rows
+    # before aggregation. Both are correct for their respective input shapes.
     billable   = total_hours
     completion = 0.0
 

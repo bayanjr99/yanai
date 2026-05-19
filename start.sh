@@ -6,7 +6,7 @@ mkdir -p "${DATA_ROOT:-data}"
 mkdir -p "${OUTPUT_ROOT:-output}"
 
 # Start Streamlit on the port Render provides
-exec streamlit run app.py \
+exec streamlit run app_gpt_dashboard.py \
   --server.port "${PORT:-8501}" \
   --server.address 0.0.0.0 \
   --server.headless true \

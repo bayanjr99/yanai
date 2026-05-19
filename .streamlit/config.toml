@@ -1,15 +1,18 @@
+[theme]
+# Brand palette aligned with the Yanai Personnel logo (deep green + lime).
+primaryColor             = "#16A34A"
+backgroundColor          = "#F8FAFC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor                = "#0F172A"
+font                     = "sans serif"
+
 [server]
-headless = true
-enableCORS = false
-enableXsrfProtection = false
-maxUploadSize = 50
+headless             = true
+enableCORS           = false
+enableXsrfProtection = true
 
 [browser]
 gatherUsageStats = false
 
-[theme]
-primaryColor = "#1F497D"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f9fafb"
-textColor = "#111827"
-font = "sans serif"
+[runner]
+magicEnabled = false

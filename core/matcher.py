@@ -58,9 +58,8 @@ def resolve_client(
         score = similarity(sn, normalize(e["site"]))
         if contains(sn, normalize(e["site"])) or contains(normalize(e["site"]), sn):
             score = max(score, 0.7)
-        # Exact country match gets a boost to prefer country-specific cost entries
-        if e.get("country") and normalize(e["country"]) == normalize(pdf_site):
-            score = max(score, 0.5)
+        # Country boost removed: comparing e["country"] to pdf_site (a site name)
+        # was semantically wrong (apples vs oranges) and could boost unrelated entries.
         if score > best_score:
             best_score = score
             best_entry = e

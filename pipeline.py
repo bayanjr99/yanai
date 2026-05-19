@@ -37,6 +37,10 @@ MASTER_PATH   = os.path.join(MASTER_DIR, "master_full.parquet")
 MASTER_XLSX   = os.path.join(MASTER_DIR, "master_full.xlsx")
 CALENDAR_XLSX = os.path.join(MASTER_DIR, "calendar.xlsx")
 
+# Set STRICT_MODE=1 in env to drop rows that have no client/site after Excel override.
+# Default (False) keeps them with client_source="missing" so they appear in reports.
+STRICT_MODE = os.getenv("STRICT_MODE", "").lower() in ("1", "true", "yes")
+
 _AGREEMENTS_CANDIDATES = [
     os.path.join(DATA_ROOT, "agreements.xlsx"),
     os.path.join(DATA_ROOT, "agreements", "agreements.xlsx"),
@@ -115,7 +119,12 @@ def list_available_months(data_root: str = DATA_ROOT) -> list[str]:
     """
     Return sorted list of MM-YYYY months that have source data in
     data/MM-YYYY/ or data/months/MM-YYYY/.
+
+    Recognises both the legacy file naming (``hours.pdf``, ``hours.xlsx``,
+    ``billing.xlsx``) and the new Andromeda naming (``hours1.pdf``,
+    ``employeeHoursAndromeda_*.xlsx``, ``hours.xls``).
     """
+    import glob as _g
     found: set[str] = set()
 
     def _scan(root: str) -> None:
@@ -127,8 +136,15 @@ def list_available_months(data_root: str = DATA_ROOT) -> list[str]:
             path = os.path.join(root, name)
             if not os.path.isdir(path):
                 continue
-            if any(os.path.exists(os.path.join(path, f))
-                   for f in ("hours.pdf", "hours.xlsx", "billing.xlsx")):
+            # Legacy patterns
+            legacy = any(os.path.exists(os.path.join(path, f))
+                         for f in ("hours.pdf", "hours.xlsx", "billing.xlsx", "hours.xls"))
+            # New Andromeda patterns
+            new_andromeda = (
+                bool(_g.glob(os.path.join(path, "employeeHoursAndromeda*.xlsx"))) or
+                bool(_g.glob(os.path.join(path, "hours*.pdf")))
+            )
+            if legacy or new_andromeda:
                 found.add(name)
 
     _scan(os.path.join(data_root, "months"))
@@ -251,6 +267,7 @@ def _aggregate(
     grp_keys = ["employee_id", "employee_name", "site"]
     agg = detail_df.groupby(grp_keys, as_index=False).agg(
         client            = ("client",             "first"),
+        country           = ("country",            "first"),
         match_reason      = ("match_reason",       "first"),
         billing_type      = ("billing_type",       "first"),
         rate              = ("rate",               "first"),
@@ -270,7 +287,18 @@ def _aggregate(
     agg = agg.sort_values(["employee_id", "monthly_min"], ascending=[True, False]).reset_index(drop=True)
 
     emp_billable_totals: dict[str, float] = agg.groupby("employee_id")["billable_sub"].sum().to_dict()
-    seen_monthly_completion: set[str] = set()
+
+    # One governing monthly_min per employee = the maximum across all their site rows.
+    # Prevents double-billing when the same employee has rows with different monthly_min values
+    # (e.g. two clients with different agreements).
+    emp_max_monthly_min: dict[str, float] = (
+        agg[agg["billing_type"] == "hourly"]
+        .groupby("employee_id")["monthly_min"]
+        .max()
+        .fillna(0)
+        .to_dict()
+    )
+
     final_rows: list[dict] = []
 
     for _, row in agg.iterrows():
@@ -284,14 +312,15 @@ def _aggregate(
         completion_monthly = 0.0
         emp_id_str   = str(row["employee_id"])
 
-        if (billing_type == "hourly"
-                and monthly_min > 0
-                and daily_min == 0
-                and emp_id_str not in seen_monthly_completion):
-            emp_total = emp_billable_totals.get(emp_id_str, billable)
-            if emp_total < monthly_min:
-                completion_monthly = monthly_min - emp_total
-                seen_monthly_completion.add(emp_id_str)
+        if billing_type == "hourly" and monthly_min > 0 and daily_min == 0:
+            governing_min = emp_max_monthly_min.get(emp_id_str, monthly_min)
+            emp_total     = emp_billable_totals.get(emp_id_str, billable)
+            if emp_total > 0 and emp_total < governing_min:
+                # Distribute completion proportionally across all sites for this employee,
+                # using one governing monthly_min (the max across their agreements).
+                total_completion   = governing_min - emp_total
+                emp_share          = billable / emp_total
+                completion_monthly = round(total_completion * emp_share, 2)
                 billable    += completion_monthly
                 billing_amt  = round(billable * rate, 2)
 
@@ -316,6 +345,7 @@ def _aggregate(
             "employee_name":    str(row["employee_name"]),
             "client":           str(row["client"]),
             "site":             site,
+            "country":          str(row.get("country") or ""),
             "match_reason":     str(row["match_reason"]),
             "billing_type":     billing_type,
             "rate":             rate,
@@ -427,6 +457,7 @@ def _bill_monthly(
             "employee_name":    emp_name,
             "client":           client,
             "site":             site,
+            "country":          worker_country,
             "match_reason":     match_reason if agreement else "אין הסכם",
             "days":             float(row.get("days") or 0),
             "total_hours":      float(row.get("total_hours") or 0),
@@ -494,6 +525,223 @@ def _load_billing_xlsx(path: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Excel override helpers
+# ---------------------------------------------------------------------------
+
+_NULL_LIKE = {"", "nan", "none", "null", "n/a", "-"}
+
+
+def _norm_id(v) -> str:
+    """Canonical employee_id: strip whitespace, remove leading zeros, lowercase."""
+    s = str(v).strip()
+    # Remove trailing ".0" that pandas adds when reading int-like ids as float
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
+
+def _build_employee_map(costs: dict) -> pd.DataFrame:
+    """
+    Build employee_id → {client, site, country} from the loaded costs dict.
+    Takes the first entry per employee_id (costs.xlsx is the source of truth).
+    Normalises employee_id to plain string (no trailing .0, no whitespace).
+    Returns a DataFrame indexed by employee_id.
+    """
+    rows = []
+    for emp_id, entries in costs.items():
+        emp_id_clean = _norm_id(emp_id)
+        if not emp_id_clean or emp_id_clean.lower() in _NULL_LIKE:
+            continue
+        if not entries:
+            continue
+        e = entries[0]
+        rows.append({
+            "employee_id": emp_id_clean,
+            "client":  str(e.get("client",  "") or "").strip(),
+            "site":    str(e.get("site",    "") or "").strip(),
+            "country": str(e.get("country", "") or "").strip(),
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=["employee_id", "client", "site", "country"]).set_index("employee_id")
+
+    df = pd.DataFrame(rows)
+    for col in ("client", "site", "country"):
+        df[col] = df[col].apply(lambda v: "" if str(v).strip().lower() in _NULL_LIKE else str(v).strip())
+
+    # Guard against duplicate employee_ids after normalisation (keep first)
+    df = df.drop_duplicates(subset="employee_id", keep="first")
+    return df.set_index("employee_id")
+
+
+def _apply_excel_overrides(
+    detail_df: pd.DataFrame,
+    employee_map: pd.DataFrame,
+    strict_mode: bool = False,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Override client / site / country in detail_df from Excel (costs.xlsx).
+
+    Rules:
+    - Excel value present  → use Excel, mark source "excel_override"
+    - Excel value absent   → keep existing value, mark source "pdf" or "missing"
+
+    Adds columns: client_source, site_source, country_source.
+    Prints a debug summary and per-employee validation table.
+    Warns for any remaining missing values (with employee_id + employee_name).
+
+    strict_mode=True  → drop rows that still have no client or site after all overrides.
+    strict_mode=False → keep those rows; callers will surface them via issues_df.
+
+    Returns (df, unmapped_issue_rows).
+    """
+    if detail_df.empty:
+        return detail_df, []
+
+    df = detail_df.copy()
+    unmapped_issues: list[dict] = []
+
+    # ── 1. Normalise employee_id on both sides before any join ───────────────
+    df["employee_id"] = df["employee_id"].apply(_norm_id)
+    employee_map = employee_map.copy()
+    employee_map.index = employee_map.index.map(_norm_id)
+    employee_map = employee_map[~employee_map.index.duplicated(keep="first")]
+
+    # ── 2. Ensure target columns exist ───────────────────────────────────────
+    for col in ("client", "site", "country"):
+        if col not in df.columns:
+            df[col] = ""
+
+    # ── 3. Initialise source columns based on current (pre-override) state ───
+    for col in ("client", "site", "country"):
+        missing_mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
+        df[f"{col}_source"] = "pdf"
+        df.loc[missing_mask, f"{col}_source"] = "missing"
+
+    # excel_ids is set here so step 7 can use it regardless of empty/non-empty map
+    excel_ids: set = set()
+
+    if employee_map.empty:
+        print("[Excel Override] employee map is empty — no overrides applied")
+    else:
+        n_employees = len(employee_map)
+
+        # ── 4. Cross-reference: pipeline ids vs Excel map ────────────────────
+        pipeline_ids = set(df["employee_id"].unique())
+        excel_ids    = set(employee_map.index)
+
+        missing_from_excel = sorted(pipeline_ids - excel_ids)
+        in_excel_not_used  = sorted(excel_ids - pipeline_ids)
+
+        if missing_from_excel:
+            print(
+                f"[Excel Override][Warning] {len(missing_from_excel)} employee_id(s) "
+                f"in pipeline but NOT in Excel map: {missing_from_excel}"
+            )
+        if in_excel_not_used:
+            print(
+                f"[Excel Override][Info] {len(in_excel_not_used)} employee_id(s) "
+                f"in Excel map but not in this dataset: {in_excel_not_used}"
+            )
+
+        # ── 5. Apply overrides ───────────────────────────────────────────────
+        n_rows_updated = 0
+        for col in ("client", "site", "country"):
+            excel_vals = df["employee_id"].map(employee_map[col])
+            has_excel  = excel_vals.notna() & (excel_vals.astype(str).str.strip() != "")
+
+            before = df[col].astype(str).str.strip()
+            df[col] = excel_vals.where(has_excel, df[col]).fillna("").astype(str).str.strip()
+
+            changed = has_excel & (before != df[col].astype(str).str.strip())
+            df.loc[has_excel, f"{col}_source"] = "excel_override"
+            n_rows_updated += int(changed.sum())
+
+        print(f"[Excel Override] employees in map : {n_employees}")
+        print(f"[Excel Override] rows updated     : {n_rows_updated}")
+
+        # ── 6. Per-employee validation table ─────────────────────────────────
+        val_rows = []
+        for emp_id in sorted(pipeline_ids):
+            in_excel = emp_id in excel_ids
+            val_rows.append({
+                "employee_id":       emp_id,
+                "exists_in_excel":   in_excel,
+                "client_from_excel": employee_map.at[emp_id, "client"] if in_excel else "",
+                "site_from_excel":   employee_map.at[emp_id, "site"]   if in_excel else "",
+            })
+        not_matched = pd.DataFrame(val_rows)
+        not_matched = not_matched[~not_matched["exists_in_excel"]]
+        if not not_matched.empty:
+            print("[Excel Override] Unmatched employees (exists_in_excel=False):")
+            print(not_matched.to_string(index=False))
+
+    # ── 7. Final enforcement: handle rows still missing client or site ────────
+    for col in ("client", "site"):
+        missing = df[col].isna() | (df[col].astype(str).str.strip() == "")
+        if not missing.any():
+            continue
+
+        # Build per-employee warning lines (include employee_name)
+        bad_emp = (
+            df[missing][["employee_id", "employee_name"]]
+            .drop_duplicates()
+            .sort_values("employee_id")
+        ) if "employee_name" in df.columns else (
+            df[missing][["employee_id"]].drop_duplicates().sort_values("employee_id")
+        )
+
+        for _, r in bad_emp.iterrows():
+            emp_id   = str(r["employee_id"])
+            emp_name = str(r.get("employee_name", "")) if "employee_name" in r.index else ""
+            print(
+                f"[Warning] עובד ללא מיפוי '{col}': "
+                f"employee_id={emp_id}, employee_name={emp_name}"
+            )
+            # Only add to issues once per employee (not once per column)
+            if col == "client":
+                emp_rows  = df[df["employee_id"] == emp_id]
+                emp_cost  = float(emp_rows["cost"].sum())        if "cost"        in emp_rows.columns else 0.0
+                emp_hours = float(emp_rows["total_hours"].sum()) if "total_hours" in emp_rows.columns else 0.0
+
+                # Actionable suggestion based on whether the id is in Excel at all
+                if emp_id in excel_ids:
+                    fix_suggestion = "השלם לקוח/אתר חסר ב-costs.xlsx"
+                    fix_reason     = "fields_empty"
+                else:
+                    fix_suggestion = "הוסף עובד לקובץ costs.xlsx"
+                    fix_reason     = "not_in_excel"
+
+                unmapped_issues.append({
+                    "employee_id":    emp_id,
+                    "employee_name":  emp_name,
+                    "site":           str(emp_rows["site"].iloc[0]) if not emp_rows.empty else "",
+                    "issue_type":     "עובד חסר מיפוי",
+                    "fix_reason":     fix_reason,
+                    "fix_suggestion": fix_suggestion,
+                    "suggested_fix":  fix_suggestion,
+                    "description":    (
+                        f"עובד {emp_id} ({emp_name}): {fix_suggestion}"
+                    ),
+                    "cost":           emp_cost,
+                    "total_hours":    emp_hours,
+                })
+
+        if strict_mode:
+            n_dropped = int(missing.sum())
+            print(
+                f"[STRICT_MODE] מוחק {n_dropped} שורות עם '{col}' חסר "
+                f"(employee_ids: {bad_emp['employee_id'].tolist()})"
+            )
+            df = df[~missing].reset_index(drop=True)
+        else:
+            # Keep rows visible; client_source="missing" stays as the marker
+            pass
+
+    return df, unmapped_issues
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -524,6 +772,11 @@ def run_full_pipeline(
     elif not is_pdf and os.path.exists(hours_path):
         monthly_df      = _load_hours_excel(hours_path)
         detail_monthly, issue_rows = _bill_monthly(monthly_df, agreements, costs)
+        employee_map = _build_employee_map(costs)
+        detail_monthly, _unmapped = _apply_excel_overrides(
+            detail_monthly, employee_map, strict_mode=STRICT_MODE
+        )
+        issue_rows.extend(_unmapped)
         return PipelineResult(
             detail_df  = detail_monthly,
             daily_df   = pd.DataFrame(),
@@ -535,6 +788,10 @@ def run_full_pipeline(
         raise FileNotFoundError(f"קובץ שעות לא נמצא: {hours_path}")
 
     detail_df = _aggregate(detail_daily_df, costs, issue_rows)
+
+    employee_map = _build_employee_map(costs)
+    detail_df, _unmapped = _apply_excel_overrides(detail_df, employee_map, strict_mode=STRICT_MODE)
+    issue_rows.extend(_unmapped)
 
     month_str = ""
     if not detail_daily_df.empty and "date" in detail_daily_df.columns:

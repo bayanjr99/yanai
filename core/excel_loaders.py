@@ -106,8 +106,8 @@ def _parse_teken(text: str) -> tuple[float, float]:
     if m:
         monthly_min = float(m.group(1))
     else:
-        # bare number followed by שעות
-        m = re.search(r"(\d{3})\s*שעות", text)
+        # bare number followed by שעות (2–4 digits: covers 99h and 1080h)
+        m = re.search(r"(\d{2,4})\s*שעות", text)
         if m:
             monthly_min = float(m.group(1))
 

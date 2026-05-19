@@ -1,7 +1,7 @@
 """
 core/ai_insights.py — CFO-grade financial analysis layer.
 
-All functions load from data/master_full.xlsx.
+Loads from output/master/master_full.xlsx (created by pipeline.build_master_full()).
 Simple questions answered with pandas; complex ones fall back to Claude.
 """
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
-_DATA_PATH = Path(__file__).parent.parent / "data" / "master_full.xlsx"
+_DATA_PATH = Path(__file__).parent.parent / "output" / "master" / "master_full.xlsx"
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +157,12 @@ def detect_problems() -> dict[str, list]:
     - low_margin_clients    : margin < 10% (but not losing)
     - cost_exceeds_billing  : total cost > total billing
     - revenue_drops         : billing dropped > 15% MoM
+
+    Internal entities (our own company units — see ``core.internal_entities``)
+    are excluded: their cost-without-billing is overhead, not a problem.
     """
+    from core.internal_entities import is_internal
+
     df = load_data()
 
     by_client = (
@@ -170,17 +175,20 @@ def detect_problems() -> dict[str, list]:
         ).round(1).fillna(-999.0))
     )
 
+    # Mask out internal entities from problem detection
+    _is_internal = by_client["client"].astype(str).map(is_internal)
+
     loss_clients = by_client.loc[
-        by_client["profit"] < 0, "client"
+        (by_client["profit"] < 0) & (~_is_internal), "client"
     ].tolist()
 
     low_margin_clients = by_client.loc[
-        (by_client["profit"] >= 0) & (by_client["margin"] < 10),
+        (by_client["profit"] >= 0) & (by_client["margin"] < 10) & (~_is_internal),
         "client",
     ].tolist()
 
     cost_exceeds_billing = by_client.loc[
-        by_client["cost"] > by_client["billing"],
+        (by_client["cost"] > by_client["billing"]) & (~_is_internal),
         "client",
     ].tolist()
 
@@ -250,8 +258,12 @@ def generate_summary_text() -> str:
     top_client        = client_profit.idxmax()
     top_client_profit = client_profit.max()
 
-    # Loss clients
-    loss_clients = client_profit[client_profit < 0].index.tolist()
+    # Loss clients — exclude internal entities (overhead is not a "loss")
+    from core.internal_entities import is_internal
+    loss_clients = [
+        c for c in client_profit[client_profit < 0].index.tolist()
+        if not is_internal(c)
+    ]
 
     lines = [
         f"=== Business Summary ({months[0]} – {latest}) ===",

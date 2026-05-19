@@ -146,37 +146,3 @@ def apply_rules(
     )
 
 
-def apply_monthly_min(
-    billable_subtotal: float,
-    daily_completion_total: float,
-    monthly_min: float,
-    billing_type: str,
-    daily_min: float,
-    rate: float,
-) -> tuple[float, float]:
-    """
-    Apply monthly_min AFTER aggregation (never per-day).
-
-    Only applies for hourly billing when daily_min is NOT set.
-    If daily_min > 0, daily completion already guarantees the floor per day;
-    monthly_min would double-count.
-
-    Returns
-    -------
-    (additional_completion, updated_billing_amount)
-    """
-    if billing_type != "hourly":
-        return 0.0, billable_subtotal * rate if billing_type == "hourly" else 0.0
-
-    if monthly_min <= 0:
-        return 0.0, round(billable_subtotal * rate, 2)
-
-    if daily_min > 0:
-        # daily completion already handles the floor — monthly_min is a cap, not a floor
-        return 0.0, round(billable_subtotal * rate, 2)
-
-    if billable_subtotal < monthly_min:
-        extra = monthly_min - billable_subtotal
-        return round(extra, 2), round(monthly_min * rate, 2)
-
-    return 0.0, round(billable_subtotal * rate, 2)
