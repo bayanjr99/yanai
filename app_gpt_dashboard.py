@@ -985,11 +985,19 @@ if not _std_xlsx_present:
     logger.error("STANDARDS FILE MISSING — data/תקן.xlsx not found")
 
 # ── Data freshness check — warn if source files are newer than the cache ─────
+# Skipped entirely on Streamlit Cloud: every git checkout rewrites file mtimes
+# with timing that depends on git's checkout order, so the "source newer than
+# cache" comparison produces false positives. The check is useful only when
+# the user is editing local files between runs of run_build.py.
 import glob as _glob
 import time as _time
 _here = os.path.dirname(os.path.abspath(__file__))
+_IS_STREAMLIT_CLOUD = (
+    "/mount/src/" in os.path.abspath(__file__)
+    or os.environ.get("HOSTNAME", "").startswith("streamlit-")
+)
 _cache_pq = os.path.join(_here, "output", "cache", "processed_data.parquet")
-if os.path.exists(_cache_pq):
+if not _IS_STREAMLIT_CLOUD and os.path.exists(_cache_pq):
   _cache_mt = os.path.getmtime(_cache_pq)
   _sources = (
     _glob.glob(os.path.join(_here, "data", "*", "*.xlsx")) +
@@ -997,7 +1005,9 @@ if os.path.exists(_cache_pq):
     _glob.glob(os.path.join(_here, "data", "*", "*.pdf"))  +
     _glob.glob(os.path.join(_here, "data", "*.xlsx"))
   )
-  _newer = [p for p in _sources if os.path.getmtime(p) > _cache_mt + 60]  # 1-min slack
+  # Slack widened from 60s to 1 hour — git checkouts can spread mtimes across
+  # several seconds and we don't want spurious warnings.
+  _newer = [p for p in _sources if os.path.getmtime(p) > _cache_mt + 3600]
   if _newer:
     _rel = [os.path.relpath(p, _here) for p in _newer[:5]]
     _more = f" +{len(_newer)-5} נוספים" if len(_newer) > 5 else ""
