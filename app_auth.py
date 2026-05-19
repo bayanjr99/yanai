@@ -290,7 +290,11 @@ def require_login() -> None:
     # asynchronously via JS, so ctrl.getAll() can still return the old token
     # on the very next render and would silently log the user back in.
     # The flag is consumed (popped) so the next render reads cookies normally.
-    if st.session_state.pop("_just_logged_out", False):
+    # We also remember it in a local so the "wait for cookie" loop below
+    # can be skipped — after a deliberate logout the login form should
+    # appear instantly, not after 4 seconds of skeleton.
+    _came_from_logout = st.session_state.pop("_just_logged_out", False)
+    if _came_from_logout:
         _auth_logger.info("require_login: skipping cookie read (just logged out)")
         token: str | None = None
     else:
@@ -337,6 +341,7 @@ def require_login() -> None:
     # with a valid "remember me" cookie were prematurely seeing the
     # login form on browser refresh. 8 × 0.5s = 4s max wait.
     if (ctrl is not None
+            and not _came_from_logout
             and not st.session_state.get("_login_form_submitted")):
         waits = st.session_state.get("_cookie_wait_count", 0)
         if waits < 8:
