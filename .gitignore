@@ -54,6 +54,8 @@ data/overrides.xlsx
 # Keep folder structure but not content
 !data/.gitkeep
 !data/agreements/.gitkeep
+# Exception: standards/regulations reference file (not customer data)
+!data/תקן.xlsx
 
 # Temp / debug files
 tmp*.json
