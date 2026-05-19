@@ -278,23 +278,31 @@ def require_login() -> None:
 
     ctrl = _make_controller()
 
-    # Try to read the cookie. On the first 1-2 renders this returns nothing
-    # (the JS hasn't replied), so we'll show a loading screen instead of
-    # the login form below.
-    token: str | None = None
-    if ctrl is not None:
-        try:
-            all_cookies = ctrl.getAll()
-            if isinstance(all_cookies, dict):
-                token = all_cookies.get(_COOKIE_NAME)
-            elif all_cookies is None:
-                # try direct .get() too — some library versions populate it
-                try:
-                    token = ctrl.get(_COOKIE_NAME)
-                except Exception:
-                    token = None
-        except Exception:
-            token = None
+    # If the user just hit "logout", ignore any still-present cookie for THIS
+    # render. The cookie controller's remove() is dispatched to the browser
+    # asynchronously via JS, so ctrl.getAll() can still return the old token
+    # on the very next render and would silently log the user back in.
+    # The flag is consumed (popped) so the next render reads cookies normally.
+    if st.session_state.pop("_just_logged_out", False):
+        token: str | None = None
+    else:
+        # Try to read the cookie. On the first 1-2 renders this returns nothing
+        # (the JS hasn't replied), so we'll show a loading screen instead of
+        # the login form below.
+        token = None
+        if ctrl is not None:
+            try:
+                all_cookies = ctrl.getAll()
+                if isinstance(all_cookies, dict):
+                    token = all_cookies.get(_COOKIE_NAME)
+                elif all_cookies is None:
+                    # try direct .get() too — some library versions populate it
+                    try:
+                        token = ctrl.get(_COOKIE_NAME)
+                    except Exception:
+                        token = None
+            except Exception:
+                token = None
 
     # If we have a valid token, log in and return immediately.
     if token:
@@ -343,30 +351,27 @@ def current_user() -> str | None:
 
 
 def logout() -> None:
-    """Clear cookie + session, then HARD-RELOAD the browser.
+    """Clear cookie + session, then rerun so require_login() shows the form.
 
-    A full reload (instead of st.rerun) is the only reliable way to:
-      • drop every DOM artefact left over from the dashboard CSS / scripts
-        — otherwise the previous render's `<style>` and `<img>` tags can
-        flash on top of the login form for a frame ("image opens then
-        closes" bug);
-      • clear every Streamlit-internal cached widget state without having
-        to enumerate every key in session_state;
-      • guarantee no in-between state where Dashboard + Login are both
-        partially mounted on the page.
+    Previous implementation used `window.parent.location.reload()` injected
+    via streamlit.components.v1.html. On Streamlit Community Cloud the
+    component iframe is sandboxed cross-origin, so the parent reload throws
+    a SecurityError and falls through to reloading only the (invisible)
+    iframe — which does nothing user-visible. The button appeared dead.
 
-    Sequence:
-      1. Server-side: remove the auth cookie + clear session_state auth keys.
-      2. Render a minimal "logging out" screen (NEUTRAL background — NO
-         worker-photo image — so even if the reload is briefly delayed
-         the user sees a clean transition, not a stretched JPG).
-      3. Inject JS that forces `window.location.reload(true)`.
+    This version:
+      • Removes the auth cookie (best-effort via streamlit-cookies-controller).
+      • Sets `_just_logged_out` so require_login() ignores any cookie that
+        hasn't yet been wiped on the browser side (the JS removal is async
+        and may not have flushed before the next render).
+      • Clears session_state auth keys.
+      • Calls st.rerun() — require_login() then renders the login form.
 
-    The minimal screen + reload combo replaces st.rerun() entirely; the
-    function returns without ever calling st.rerun, and the browser does
-    the rest.
+    No splash screen: st.rerun() is fast enough that one isn't needed, and
+    the previous splash relied on the same iframe mechanism that doesn't
+    work on the cloud anyway.
     """
-    # 1. Cookie removal (server-side).
+    # 1. Cookie removal (server-side request to the browser via JS).
     ctrl = _make_controller()
     if ctrl is not None:
         try:
@@ -374,10 +379,10 @@ def logout() -> None:
         except Exception:
             pass
 
-    # 2. Session-state cleanup. Auth-related keys ONLY — we intentionally
-    #    DO NOT clear business cache (`raw`, parquet) because that data
-    #    is per-process, not per-session, and clearing it would force the
-    #    next login to re-parse all PDFs (slow).
+    # 2. Force require_login() to ignore any still-present cookie this render.
+    st.session_state["_just_logged_out"] = True
+
+    # 3. Session-state cleanup. Auth-related keys ONLY.
     _AUTH_KEYS = (
         "_auth", "_user", "_login_attempts", "_cookie_wait_count",
         "_login_form_submitted",
@@ -385,74 +390,9 @@ def logout() -> None:
     for k in _AUTH_KEYS:
         st.session_state.pop(k, None)
 
-    # 3. Render the "logging out" splash + force-reload script. The splash
-    #    uses a plain gradient (no images) — eliminates any chance of the
-    #    login background JPG appearing as an oversized element during the
-    #    brief moment before the browser navigates away.
-    #
-    # CSS goes via st.markdown (HTML+CSS render reliably).
-    st.markdown(
-        """
-        <style>
-        body, .stApp { background: linear-gradient(180deg,#F1F5F9 0%,#E2E8F0 100%) !important; }
-        /* hide every leftover dashboard element while we wait for reload */
-        [data-testid="stHeader"], [data-testid="stSidebar"],
-        section[data-testid="stSidebar"], [data-testid="collapsedControl"],
-        .top-bar, [data-baseweb="tab-list"], [data-testid="stPlotlyChart"],
-        [data-testid="stDataFrame"], .kpi-strip, .filter-marker,
-        [data-testid="stVerticalBlock"]:has(.filter-marker) { display:none !important; }
-        @keyframes _yp_logout_spin { to { transform: rotate(360deg); } }
-        .yp-logout-screen {
-            position:fixed;inset:0;display:flex;flex-direction:column;
-            align-items:center;justify-content:center;z-index:99999;
-            background:linear-gradient(180deg,#F1F5F9 0%,#E2E8F0 100%);
-            font-family:'Inter','Segoe UI',Arial,sans-serif;direction:rtl;
-        }
-        .yp-logout-spinner {
-            width:46px;height:46px;border:4px solid #BBF7D0;
-            border-top-color:#16A34A;border-radius:50%;
-            animation:_yp_logout_spin .8s linear infinite;margin-bottom:18px;
-        }
-        .yp-logout-msg {
-            font-size:14px;font-weight:700;color:#0E5A2E;
-            letter-spacing:.2px;
-        }
-        .yp-logout-hint{font-size:11px;color:#64748B;margin-top:14px;}
-        </style>
-        <div class="yp-logout-screen">
-          <div class="yp-logout-spinner"></div>
-          <div class="yp-logout-msg">מתנתק...</div>
-          <div class="yp-logout-hint">אם המסך לא מתרענן תוך 2 שניות,
-            לחץ F5</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    # JS that does the actual reload — st.markdown strips <script> tags, so
-    # we use components.v1.html which mounts an iframe whose JS DOES run.
-    # height=0 → invisible iframe; scrolling=False → no scroll bars.
-    try:
-        from streamlit.components.v1 import html as _components_html
-        _components_html(
-            """
-            <script>
-            // Tiny delay so the cookie-remove HTTP call finishes before reload.
-            setTimeout(function() {
-              try { window.parent.location.reload(); }
-              catch(e) { window.location.reload(); }
-            }, 200);
-            </script>
-            """,
-            height=0, scrolling=False,
-        )
-    except Exception:
-        # Last-resort fallback: regular Streamlit rerun. Less clean (some
-        # DOM may persist) but at least the user gets back to login.
-        try: st.rerun()
-        except Exception: pass
-    # IMPORTANT: stop server-side execution NOW. Anything after this would
-    # try to render dashboard content that the JS reload is about to wipe.
-    st.stop()
+    # 4. Rerun. require_login() runs first at the top of the dashboard and
+    #    will short-circuit to the login form.
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
