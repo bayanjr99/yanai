@@ -25,6 +25,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import time
 
 import bcrypt
@@ -35,6 +36,10 @@ try:
     _HAS_COOKIES = True
 except ImportError:
     _HAS_COOKIES = False
+
+# Reuse the dashboard's logger so auth events end up in logs/dashboard.log
+# (and on Streamlit Cloud's app logs which capture stderr).
+_auth_logger = logging.getLogger("auth")
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +279,8 @@ def require_login() -> None:
     """
     # Fast path: already authenticated in this Streamlit session.
     if st.session_state.get("_auth"):
+        _auth_logger.debug("require_login: fast-path, user=%s",
+                           st.session_state.get("_user"))
         return
 
     ctrl = _make_controller()
@@ -284,6 +291,7 @@ def require_login() -> None:
     # on the very next render and would silently log the user back in.
     # The flag is consumed (popped) so the next render reads cookies normally.
     if st.session_state.pop("_just_logged_out", False):
+        _auth_logger.info("require_login: skipping cookie read (just logged out)")
         token: str | None = None
     else:
         # Try to read the cookie. On the first 1-2 renders this returns nothing
@@ -312,7 +320,10 @@ def require_login() -> None:
             st.session_state["_user"] = username
             # Clear the "give cookies more time" counter — we're in.
             st.session_state.pop("_cookie_wait_count", None)
+            _auth_logger.info("require_login: cookie-restored user=%s", username)
             return
+        else:
+            _auth_logger.warning("require_login: invalid/stale token, dropping")
 
     # No valid token. Two reasons this could be:
     #   (a) Cookies haven't loaded yet (need another render cycle).
@@ -321,17 +332,22 @@ def require_login() -> None:
     # render cycles of loading screen before giving up and showing the
     # login form. The "_login_form_submitted" flag short-circuits this
     # after the user has explicitly tried to log in.
-    # NOTE: bumped from 2 → 4 waits because on slower networks the cookie
-    # JS round-trip often takes longer than 2 reruns, and "remember me"
-    # users were prematurely seeing the login form again.
+    # NOTE: bumped from 4 → 8 waits because on Streamlit Cloud the
+    # JS round-trip for cookie reads can exceed 2 seconds, and users
+    # with a valid "remember me" cookie were prematurely seeing the
+    # login form on browser refresh. 8 × 0.5s = 4s max wait.
     if (ctrl is not None
             and not st.session_state.get("_login_form_submitted")):
         waits = st.session_state.get("_cookie_wait_count", 0)
-        if waits < 4:
+        if waits < 8:
             st.session_state["_cookie_wait_count"] = waits + 1
+            _auth_logger.debug("require_login: waiting for cookie (cycle %d/8)",
+                               waits + 1)
             _render_loading_screen()
             time.sleep(0.5)
             st.rerun()
+        else:
+            _auth_logger.info("require_login: no cookie after 8 waits → login form")
 
     # ----- Fall back to login form ───────────────────────────────────────────
     users = _load_users()
@@ -371,13 +387,15 @@ def logout() -> None:
     the previous splash relied on the same iframe mechanism that doesn't
     work on the cloud anyway.
     """
+    _auth_logger.info("logout: user=%s", st.session_state.get("_user"))
+
     # 1. Cookie removal (server-side request to the browser via JS).
     ctrl = _make_controller()
     if ctrl is not None:
         try:
             ctrl.remove(_COOKIE_NAME)
-        except Exception:
-            pass
+        except Exception as _ex:
+            _auth_logger.warning("logout: cookie remove failed: %s", _ex)
 
     # 2. Force require_login() to ignore any still-present cookie this render.
     st.session_state["_just_logged_out"] = True
@@ -651,7 +669,7 @@ def _render_login(users: dict[str, str], ctrl) -> None:
                                      placeholder="הכנס סיסמה")
             remember_me = st.checkbox(
                 "זכור אותי",
-                value=False,
+                value=True,
                 help=(f"אם מסומן: לא תידרש להתחבר שוב במשך {_REMEMBER_HOURS} שעות. "
                       "אם לא מסומן: יבקש סיסמה מחדש בכל פתיחת דפדפן."),
             )
@@ -672,6 +690,8 @@ def _render_login(users: dict[str, str], ctrl) -> None:
             return
         stored = users.get(user_name)
         if stored and _verify_password(stored, password):
+            _auth_logger.info("login: success user=%s remember=%s",
+                              user_name, remember_me)
             st.session_state.update({
                 "_auth": True,
                 "_user": user_name,
@@ -711,6 +731,8 @@ def _render_login(users: dict[str, str], ctrl) -> None:
                     pass
             st.rerun()
         else:
+            _auth_logger.warning("login: failed user=%s attempts=%d",
+                                 user_name, attempts + 1)
             time.sleep(_LOGIN_DELAY_SEC)
             st.session_state["_login_attempts"] = attempts + 1
             st.error("שם משתמש או סיסמה שגויים")

@@ -1529,8 +1529,37 @@ def _save_sigs():
   with open(p,"w",encoding="utf-8") as _f: _json_mod.dump(sigs,_f,ensure_ascii=False)
 
 def _run_refresh():
+  """Refresh data button handler.
+
+  Two paths:
+  - **Local (full)**: re-runs the preprocessor over the raw PDFs/Excel in
+    data/MM-YYYY/, rebuilds parquets, clears Streamlit's data cache, reloads.
+  - **Streamlit Cloud (light)**: the raw source files are NOT in the cloud
+    deploy (they're gitignored). The parquets are the source of truth and
+    were updated by the last git push. So we only clear the Streamlit
+    cache to force re-read of the parquet from disk.
+
+  Crucially: this function NEVER touches session_state auth keys, so the
+  user stays logged in across the refresh.
+  """
   import time; _t0 = time.time()
+  _is_cloud = (
+      "/mount/src/" in os.path.abspath(__file__)
+      or os.environ.get("HOSTNAME", "").startswith("streamlit-")
+  )
   try:
+    if _is_cloud:
+      # Cloud: just clear the cache so the next render re-reads the
+      # parquet from disk. The actual rebuild has to happen locally
+      # and be pushed via git.
+      st.cache_data.clear()
+      _elapsed = time.time() - _t0
+      logger.info("[REFRESH] cloud-mode cache clear, %.2fs", _elapsed)
+      return {"success": True,
+              "message": f"מטמון נוקה ב-{_elapsed:.1f}שנ' · "
+                          "(ענן: לבנייה מחדש הריצי run_build.py מקומית ועשי git push)"}
+
+    # Local: full rebuild from raw source files.
     from core.preprocessor import build_and_save
     build_and_save()
     _save_sigs()
@@ -1543,8 +1572,10 @@ def _run_refresh():
       _msg = f"רענון הושלם ב-{_elapsed:.1f}שנ' · {_months_n} חודשים · {_rows} שורות"
     except Exception:
       _msg = f"רענון הושלם ב-{_elapsed:.1f}שנ'"
+    logger.info("[REFRESH] local rebuild done, %.2fs", _elapsed)
     return {"success":True,"message":_msg}
   except Exception as _ex:
+    logger.exception("[REFRESH] failed: %s", _ex)
     return {"success":False,"error":str(_ex)}
 
 # ═══ כותרת עליונה ═════════════════════════════════════════════════════════════
