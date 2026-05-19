@@ -4176,13 +4176,22 @@ with t4:
             xaxis=dict(side="bottom",tickfont=dict(size=11,color="#475569")),
             yaxis=dict(tickfont=dict(size=11,color="#475569")))
           _chart(_fig_corr)
-          _cph_corr=_corr.loc["עלות/שעה"].drop("עלות/שעה")
-          _strongest=_cph_corr.abs().idxmax()
-          _str_val=_cph_corr[_strongest]
-          st.caption(f"הקורלציה החזקה ביותר עם עלות/שעה היא **{_strongest}** "
-                     f"({'חיובית' if _str_val>0 else 'שלילית'}, {abs(_str_val):.2f}). "
-                     f"{'עלייה ב-' if _str_val>0 else 'ירידה ב-'}{_strongest} "
-                     f"{'מעלה' if _str_val>0 else 'מורידה'} את עלות/שעה.")
+          # Guard against all-NaN correlations: pandas 2.x raises
+          # ValueError on idxmax of an all-NA series (older versions
+          # returned NaN). This happens when a column has zero variance
+          # for the filtered slice — e.g., a single-month view where
+          # utilization is constant.
+          _cph_corr = _corr.loc["עלות/שעה"].drop("עלות/שעה")
+          if "עלות/שעה" in _corr.index and _cph_corr.abs().notna().any():
+            _strongest = _cph_corr.abs().idxmax()
+            _str_val   = _cph_corr[_strongest]
+            st.caption(f"הקורלציה החזקה ביותר עם עלות/שעה היא **{_strongest}** "
+                       f"({'חיובית' if _str_val>0 else 'שלילית'}, {abs(_str_val):.2f}). "
+                       f"{'עלייה ב-' if _str_val>0 else 'ירידה ב-'}{_strongest} "
+                       f"{'מעלה' if _str_val>0 else 'מורידה'} את עלות/שעה.")
+          else:
+            st.caption("ℹ️ אין מספיק שונוּת בנתונים לחישוב קורלציה משמעותית "
+                       "בטווח שנבחר.")
 
 
   # 7 — חיוב
